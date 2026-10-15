@@ -113,6 +113,42 @@ path to its corresponding filter file.
 The C2R configuration additionally keeps the first 50 episodes of each 550-episode
 block and applies temporally consistent appearance augmentation with probability 0.8.
 
+## Task selection
+
+`data.task_selection` narrows a run to exact task names. Leave it unset to keep
+the full dataset. Task *names*, not local indices, are the identity, so the
+selector is safe for a merged root whose `meta/tasks.jsonl` numbering differs
+from another root:
+
+```yaml
+data:
+  task_selection:
+    tasks:
+    - turn_switch
+    - rotate_qrcode
+    - blocks_ranking_size
+    - move_stapler_pad
+    - hanging_mug
+```
+
+The selection resolves before the train/validation split and before statistics
+or sample indexes, and it composes with `episode_index_filter` and the non-idle
+row filter. Each episode resolves its task from `meta/episodes.jsonl` (`tasks`,
+`task`, or a root-local `task_index`) and falls back to the parquet
+`task_index` column when the metadata carries none. A requested name that
+appears in no root, an episode without a resolvable identity, and an episode
+mixing several task identities all raise instead of silently training on the
+full data. `configs/robotwin_vlm_5tasks.yaml` uses this for the five-task
+ablation: it copies `configs/robotwin_vlm.yaml` unchanged apart from the
+selector and `training.output_dir`, so model, conditioning, augmentation,
+non-idle filtering, horizon, dimensions, optimizer, epochs, and batch settings
+are preserved.
+
+The subset still needs statistics that describe the same five tasks. Point
+`PATCHWAM_NORM_STATS` at matching statistics, or fit them from the selected
+split with `data.pretrained_norm_stats=null`; the normalization method itself is
+unchanged.
+
 ## Optional text caches
 
 The FLUX.2 policy can consume cached Qwen3 features. Set these data options:

@@ -15,7 +15,7 @@ import json
 from bisect import bisect_right
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
@@ -31,6 +31,7 @@ from .cameras import compose_cameras, prepare_rgb, resize_clip
 from .history import PastFrameSelector
 from .processing import SampleProcessor
 from .scaling import read_statistics
+from .task_selection import build_task_table, normalize_task_selection, resolve_episode_tasks
 
 
 @dataclass
@@ -65,11 +66,80 @@ def _feature_tensor(table, column, indices):
     return result.unsqueeze(-1) if result.ndim == 1 else result
 
 
+def _episode_parquet_path(root, info, index):
+    template = info.get("data_path", "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet")
+    chunk = index // int(info.get("chunks_size", 1000))
+    return root / template.format(episode_chunk=chunk, episode_index=index)
+
+
+def _episode_parquet_task_indices(root, info, index):
+    """Root-local ``task_index`` values for one episode, or None without the column."""
+    import pyarrow.parquet as pq
+
+    parquet = pq.ParquetFile(_episode_parquet_path(root, info, index))
+    if "task_index" not in parquet.schema_arrow.names:
+        return None
+    return parquet.read(columns=["task_index"])["task_index"].to_pylist()
+
+
+@dataclass
+class _RootPlan:
+    """Cached root metadata: info, filtered episode indices, task table, entries."""
+
+    info: dict
+    indices: list
+    tasks: dict
+    entries: dict
+    selected: list | None = None
+
+
+def _apply_episode_filter(indices, episode_index_filter):
+    """Apply the existing periodic episode-index filter to one root's indices."""
+    cfg = episode_index_filter or {}
+    if cfg.get("mode", "none") in {"periodic_prefix", "periodic_first", "first_k_per_period"}:
+        period, first = int(cfg["period"]), int(cfg["keep_first"])
+        offset = int(cfg.get("offset", 0))
+        if period <= 0 or not 0 <= first <= period:
+            raise ValueError("Invalid periodic episode filter")
+        return [index for index in indices if (index - offset) % period < first]
+    if cfg.get("mode", "none") not in {"none", "all", ""}:
+        raise ValueError(f"Unknown episode filter: {cfg.get('mode')}")
+    return indices
+
+
+def _plan_root(root, episode_index_filter):
+    """Read one root's metadata and apply the episode-index filter.
+
+    With a task selector active the plan is built for every configured root
+    before any train/validation partition, so candidate validation cannot be
+    decided by which roots a split happened to keep.
+    """
+    info = json.loads((root / "meta/info.json").read_text(encoding="utf-8"))
+    if str(info.get("codebase_version", "v2")).startswith("v3"):
+        raise ValueError(f"LeRobot v3 root cannot be opened as v2: {root}")
+    root_fps = float(info["fps"])
+    if not np.isfinite(root_fps) or root_fps <= 0:
+        raise ValueError(f"Dataset FPS must be finite and positive: {root}")
+    episode_meta = _json_lines(root / "meta/episodes.jsonl")
+    indices = sorted(int(item["episode_index"]) for item in episode_meta)
+    if not indices:
+        indices = list(range(int(info["total_episodes"])))
+    indices = _apply_episode_filter(indices, episode_index_filter)
+    task_rows = _json_lines(root / "meta/tasks.jsonl")
+    tasks = {int(item["task_index"]): item["task"] for item in task_rows}
+    entries = {int(item["episode_index"]): item for item in episode_meta}
+    return _RootPlan(info, indices, tasks, entries)
+
+
 class EpisodeDataset(Dataset):
     """Endpoint images and action windows with separate padding masks.
 
     At 17 frames and ratio 1, images are t/t+16 and actions are t..t+15.
     True marks invalid dimensions or steps. Corrupt samples raise.
+
+    ``task_selection`` narrows the dataset to exact task names. Matching
+    episodes resolve before the train/validation split and before statistics,
+    and the resolved selection is recorded on ``self.task_selection``.
     """
 
     def __init__(self, dataset_dirs, shape_meta, num_frames=17, video_size=(224, 448),
@@ -87,7 +157,7 @@ class EpisodeDataset(Dataset):
                  history_interval_s=1.0, history_jitter_s=0.4, history_whole_dropout=0.2,
                  history_slot_dropout=0.2, history_truncate=True, vl_history_jitter_frames=1,
                  vl_image_size=448, head_camera_key=None, subtask_column=None,
-                 require_subtask_labels=False):
+                 require_subtask_labels=False, task_selection=None):
         if lerobot_backend != "v2":
             raise ValueError("EpisodeDataset currently supports local LeRobot v2; v3 merged video files require a separate backend")
         if num_frames < 2 or global_sample_stride < 1 or sample_index_stride < 1:
@@ -135,42 +205,63 @@ class EpisodeDataset(Dataset):
             video_augmentation = augmentation_type(**video_augmentation)
         self.video_augmentation = video_augmentation if is_training_set else None
         roots = [Path(item).expanduser().resolve() for item in dataset_dirs]
+        requested_tasks = normalize_task_selection(task_selection)
+        self.task_selection = None
+        selected_episodes = {}
+        plans = []
+        if requested_tasks is not None:
+            wanted = set(requested_tasks)
+            declared, present = set(), set()
+            for root in roots:
+                plan = _plan_root(root, episode_index_filter)
+                table = build_task_table(_json_lines(root / "meta/tasks.jsonl"))
+                declared |= set(table.values())
+                resolved = resolve_episode_tasks(
+                    plan.indices, plan.entries, table, root,
+                    parquet_task_indices=partial(_episode_parquet_task_indices, root, plan.info),
+                )
+                present |= set(resolved.values())
+                plan.selected = [index for index in plan.indices if resolved[index] in wanted]
+                plans.append(plan)
+            absent = [name for name in requested_tasks
+                      if name not in declared and name not in present]
+            if absent:
+                raise ValueError(
+                    f"Requested tasks are absent from the dataset roots: {absent}. "
+                    f"Available tasks ({len(declared)}): {sorted(declared)}"
+                )
+            starved = [name for name in requested_tasks if name not in present]
+            if starved:
+                raise ValueError(
+                    f"Requested tasks have no candidate episodes after the episode-index filter: "
+                    f"{starved}. Every name is declared in meta/tasks.jsonl, but no retained "
+                    "episode uses it"
+                )
         if val_set_proportion and val_split_level == "root":
             selected = np.arange(len(roots))
             np.random.default_rng(seed).shuffle(selected)
             boundary = int(len(selected) * (1 - val_set_proportion))
             selected = selected[:boundary] if is_training_set else selected[boundary:]
-            roots = [roots[item] for item in sorted(selected)]
+            chosen = sorted(selected)
+            roots = [roots[item] for item in chosen]
+            if plans:
+                plans = [plans[item] for item in chosen]
         self.episodes = []
         fps = set()
         import pyarrow.parquet as pq
 
-        for root in roots:
-            info = json.loads((root / "meta/info.json").read_text(encoding="utf-8"))
-            if str(info.get("codebase_version", "v2")).startswith("v3"):
-                raise ValueError(f"LeRobot v3 root cannot be opened as v2: {root}")
+        for position, root in enumerate(roots):
+            plan = plans[position] if plans else _plan_root(root, episode_index_filter)
+            info, tasks = plan.info, plan.tasks
             root_fps = float(info["fps"])
-            if not np.isfinite(root_fps) or root_fps <= 0:
-                raise ValueError(f"Dataset FPS must be finite and positive: {root}")
             fps.add(root_fps)
-            chunk_size = int(info.get("chunks_size", 1000))
-            episode_meta = _json_lines(root / "meta/episodes.jsonl")
-            indices = sorted(int(item["episode_index"]) for item in episode_meta)
-            if not indices:
-                indices = list(range(int(info["total_episodes"])))
-            cfg = episode_index_filter or {}
-            if cfg.get("mode", "none") in {"periodic_prefix", "periodic_first", "first_k_per_period"}:
-                period, first, offset = int(cfg["period"]), int(cfg["keep_first"]), int(cfg.get("offset", 0))
-                if period <= 0 or not 0 <= first <= period:
-                    raise ValueError("Invalid periodic episode filter")
-                indices = [index for index in indices if (index - offset) % period < first]
-            elif cfg.get("mode", "none") not in {"none", "all", ""}:
-                raise ValueError(f"Unknown episode filter: {cfg.get('mode')}")
+            indices = list(plan.selected) if plan.selected is not None else plan.indices
             if val_set_proportion and val_split_level == "episode":
                 np.random.default_rng(seed).shuffle(indices)
                 boundary = int(len(indices) * (1 - val_set_proportion))
                 indices = indices[:boundary] if is_training_set else indices[boundary:]
-            tasks = {int(item["task_index"]): item["task"] for item in _json_lines(root / "meta/tasks.jsonl")}
+            if requested_tasks is not None:
+                selected_episodes[str(root)] = [int(index) for index in indices]
             filter_path = nonidle_filter_path
             if isinstance(filter_path, dict):
                 if str(root) not in filter_path:
@@ -181,8 +272,7 @@ class EpisodeDataset(Dataset):
                 payload = json.loads(Path(filter_path).expanduser().read_text(encoding="utf-8"))
                 ranges = payload.get("episodes", payload)
             for index in indices:
-                template = info.get("data_path", "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet")
-                path = root / template.format(episode_chunk=index // chunk_size, episode_index=index)
+                path = _episode_parquet_path(root, info, index)
                 parquet = pq.ParquetFile(path)
                 if self.require_subtask_labels and self.subtask_column not in parquet.schema_arrow.names:
                     raise KeyError(f"Missing required subtask labels {self.subtask_column!r}: {path}")
@@ -200,6 +290,9 @@ class EpisodeDataset(Dataset):
                     rows = np.arange(length, dtype=np.int64)
                 if len(rows):
                     self.episodes.append(_Episode(root, index, path, info, rows, tasks, tuple(parquet.schema_arrow.names)))
+        if requested_tasks is not None:
+            self.task_selection = {"tasks": list(requested_tasks),
+                                   "selected_episodes": selected_episodes}
         if len(fps) != 1:
             raise ValueError(f"Dataset roots must share FPS, received {sorted(fps)}")
         if not self.episodes:
@@ -271,6 +364,10 @@ class EpisodeDataset(Dataset):
             "head_camera_key": self.head_camera_key, "subtask_column": self.subtask_column,
             "require_subtask_labels": self.require_subtask_labels,
         }
+        # Only a configured selector changes the payload, so fingerprints for
+        # unselected datasets keep matching pre-selector checkpoints and resumes.
+        if self.task_selection is not None:
+            payload["task_selection"] = self.task_selection
         return sha256(json.dumps(canonical(payload), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
     def __len__(self):

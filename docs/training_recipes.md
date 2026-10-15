@@ -18,6 +18,13 @@ enabled in the ordinary benchmark configurations.
 | [LIBERO](../configs/libero.yaml) | 7 / 8 | 224×448: front and wrist views side by side | Min/max | 8 × 1 | 8 × world size |
 | [CPU smoke](../configs/smoke.yaml) | 14 / 14 | Synthetic encoded tokens | Synthetic tensors | 2 × 1 | 2 for one process |
 
+[`robotwin_vlm_5tasks.yaml`](../configs/robotwin_vlm_5tasks.yaml) is the
+`robotwin_vlm.yaml` recipe restricted to the five task names `turn_switch`,
+`rotate_qrcode`, `blocks_ranking_size`, `move_stapler_pad`, and `hanging_mug`
+through `data.task_selection`. Optimizer, five-epoch budget, LR, batch,
+augmentation, horizon, dimensions, and non-idle filtering are unchanged; see
+[task selection](data.md) for the selector contract.
+
 Benchmark configurations use 16 future actions and endpoint image pairs. RobotWin uses
 50Hz data; RoboCasa and LIBERO use 20Hz data. The 128D fixed codec consumes the
 configured raw action dimension. Changing action dimensions, normalization,
