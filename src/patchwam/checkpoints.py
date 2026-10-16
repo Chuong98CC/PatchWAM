@@ -1,8 +1,12 @@
 """Policy weights and compact training checkpoints."""
 
+import os
+import random
 from collections.abc import Mapping
+from contextlib import contextmanager
 from pathlib import Path
 
+import numpy as np
 import torch
 from safetensors.torch import load_file, save_file
 
@@ -23,6 +27,9 @@ POLICY_KEY_PREFIX = "policy."
 
 NATIVE_SUFFIX = ".safetensors"
 TORCH_SUFFIXES = (".pt", ".pth")
+
+RNG_STATE_PREFIX = "random_states_"
+RNG_STATE_KEYS = ("step", "random_state", "numpy_random_seed", "torch_manual_seed")
 
 
 def _policy_layout(model):
@@ -82,13 +89,139 @@ def _torch_state_dictionary(path):
     except RuntimeError as error:
         if "mmap" not in str(error):
             raise _unreadable(path, error) from error
-    except Exception as error:  # noqa: BLE001 - report every unsafe or unreadable file the same way
+    except Exception as error:
         raise _unreadable(path, error) from error
     # Legacy non-zip files cannot be memory mapped; the same safe loader still applies.
     try:
         return torch.load(str(path), map_location="cpu", weights_only=True)
-    except Exception as error:  # noqa: BLE001
+    except Exception as error:
         raise _unreadable(path, error) from error
+
+
+# Accelerate writes the process random state (``random``, NumPy, and the torch
+# generators) with plain ``torch.save`` and reloads it through ``torch.load``
+# without naming a ``weights_only`` mode. Since torch 2.6 that mode defaults to
+# ``True``, which rejects the NumPy array inside the saved state; Accelerate
+# swallows the failure, silently drops every random state, and then raises
+# ``KeyError: 'step'``. Allow exactly the NumPy globals those files need, the
+# same way the LIBERO initial state reader does, never by disabling weights-only
+# loading.
+def _rng_state_globals():
+    from numpy.core.multiarray import _reconstruct
+
+    return (
+        np.ndarray, _reconstruct, np.dtype,
+        type(np.dtype(np.uint32)), type(np.dtype(np.float64)),
+    )
+
+
+@contextmanager
+def safe_rng_state_loading():
+    """Allow only the NumPy types an Accelerate random state file contains."""
+    if os.environ.get("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "").lower() in {"1", "y", "yes", "true"}:
+        raise ValueError(
+            "Resuming requires weights-only loading; remove TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"
+        )
+    with torch.serialization.safe_globals(_rng_state_globals()):
+        yield
+
+
+def rng_state_path(directory, process_index):
+    """The random state file of one process inside a complete run directory."""
+    return Path(directory) / f"{RNG_STATE_PREFIX}{process_index}.pkl"
+
+
+def _unreadable_rng_state(path, error):
+    return ValueError(
+        f"Could not read the random state in {path} with torch.load(weights_only=True): "
+        f"{type(error).__name__}: {error}. PatchWAM never falls back to unsafe pickle "
+        "deserialization; resume from a complete run directory written by this training loop."
+    )
+
+
+def _validate_rng_state(states, path):
+    if not isinstance(states, Mapping):
+        raise ValueError(
+            f"{path} has an unsupported random state layout: expected a mapping, "
+            f"found {type(states).__name__}"
+        )
+    missing = [key for key in RNG_STATE_KEYS if key not in states]
+    if missing:
+        raise ValueError(f"{path} has an unsupported random state layout: missing {sorted(missing)}")
+    devices = states.get("torch_cuda_manual_seed")
+    if (
+        type(states["step"]) is not int
+        or states["step"] < 0
+        or not isinstance(states["random_state"], tuple)
+        or not isinstance(states["numpy_random_seed"], tuple)
+        or len(states["numpy_random_seed"]) != 5
+        or not isinstance(states["numpy_random_seed"][1], np.ndarray)
+        or not torch.is_tensor(states["torch_manual_seed"])
+        or (
+            devices is not None
+            and (
+                not isinstance(devices, (list, tuple))
+                or not all(torch.is_tensor(one) for one in devices)
+            )
+        )
+    ):
+        raise ValueError(f"{path} has an unsupported random state layout")
+    return states
+
+
+def read_rng_state(directory, process_index):
+    """Read one process's random state with weights-only deserialization."""
+    path = rng_state_path(directory, process_index)
+    if not path.is_file():
+        raise ValueError(
+            f"{path} is missing: exact continuation needs the saved random state of every "
+            "process, so resume from a complete run directory written by this training loop"
+        )
+    with safe_rng_state_loading():
+        try:
+            states = torch.load(str(path), map_location="cpu", weights_only=True)
+        except Exception as error:  # noqa: BLE001 - every unreadable or unsafe file is reported alike
+            raise _unreadable_rng_state(path, error) from error
+    return _validate_rng_state(states, path)
+
+
+def _rng_state_mismatches(states):
+    mismatches = []
+    if states["random_state"] != random.getstate():
+        mismatches.append("the Python random module")
+    saved_numpy = states["numpy_random_seed"]
+    live_numpy = np.random.get_state()
+    if (
+        saved_numpy[0] != live_numpy[0]
+        or not np.array_equal(saved_numpy[1], live_numpy[1])
+        or tuple(saved_numpy[2:]) != tuple(live_numpy[2:])
+    ):
+        mismatches.append("NumPy")
+    if not torch.equal(states["torch_manual_seed"], torch.get_rng_state()):
+        mismatches.append("the torch CPU generator")
+    saved_devices = states.get("torch_cuda_manual_seed")
+    if saved_devices and torch.cuda.is_available():
+        live_devices = torch.cuda.get_rng_state_all()
+        if len(saved_devices) != len(live_devices) or not all(
+            torch.equal(saved, live) for saved, live in zip(saved_devices, live_devices)
+        ):
+            mismatches.append("the torch CUDA generators")
+    return mismatches
+
+
+def require_restored_rng_state(states):
+    """Fail loudly unless the live process random state is the saved one.
+
+    ``Accelerator.load_state`` swallows every failure while restoring random
+    state, so a continuation could otherwise restart on a fresh random stream.
+    """
+    mismatches = _rng_state_mismatches(states)
+    if mismatches:
+        raise ValueError(
+            "The resumed run did not restore the saved "
+            + ", ".join(mismatches)
+            + "; continuing would not reproduce the interrupted run"
+        )
 
 
 def _same_storage(first, second):
@@ -108,16 +241,18 @@ def _upstream_alias_name(key):
 
 def _upstream_tensors(loaded, path):
     """Map an upstream release checkpoint onto native policy weight names."""
-    if not isinstance(loaded["mot"], Mapping):
-        raise ValueError(f"{path} has an unsupported layout: 'mot' must be a state dictionary")
+    mot = loaded["mot"]
     values = loaded.get(UPSTREAM_STATE_PROJECTION)
+    if not isinstance(mot, Mapping) or (values is not None and not isinstance(values, Mapping)):
+        raise ValueError(
+            f"{path} has an unsupported layout: expected state dictionaries for 'mot' and "
+            f"'{UPSTREAM_STATE_PROJECTION}', found {type(mot).__name__} and {type(values).__name__}"
+        )
     if values is None:
         raise ValueError(
             f"{path} uses an unsupported upstream layout: 'mot' requires a "
             f"'{UPSTREAM_STATE_PROJECTION}' state dictionary containing 'weight' and 'bias'"
         )
-    if not isinstance(values, Mapping):
-        raise ValueError(f"{path} has an unsupported layout: '{UPSTREAM_STATE_PROJECTION}' must be a state dictionary")
     step = loaded.get("step")
     if step is not None and (not isinstance(step, int) or isinstance(step, bool) or step < 0):
         raise ValueError(f"{path} has an unsupported layout: 'step' must be a nonnegative integer")
@@ -125,7 +260,7 @@ def _upstream_tensors(loaded, path):
     if dtype is not None and not isinstance(dtype, str):
         raise ValueError(f"{path} has an unsupported layout: 'torch_dtype' must be a string")
     tensors, aliases, unexpected = {}, {}, []
-    for key, value in loaded["mot"].items():
+    for key, value in mot.items():
         if not isinstance(key, str) or not torch.is_tensor(value):
             raise ValueError(f"{path} has an unsupported layout: 'mot' must map names to tensors, found {key!r}")
         if key.startswith(UPSTREAM_TRANSFORMER_PREFIX):
@@ -214,7 +349,7 @@ def _candidate_names(name):
 
 def _target_index(model):
     """Checkpoint keys of a model, with their policy-state or parameter target."""
-    policy, extra = _policy_layout(model)
+    _, extra = _policy_layout(model)
     index = {}
     for key in policy_weight_state(model):
         if not extra:
@@ -223,12 +358,12 @@ def _target_index(model):
             index[key] = ("policy", key[len(POLICY_KEY_PREFIX):])
         else:
             index[key] = ("parameter", key)
-    return policy, extra, index
+    return index
 
 
 def _compatible_weights(model, weights):
     """Validate every checkpoint tensor against the model before any mutation."""
-    policy, _, index = _target_index(model)
+    index = _target_index(model)
     expected = policy_weight_state(model)
     mapped, missing, unexpected = {}, [], []
     for name, tensor in weights.items():
@@ -273,7 +408,8 @@ def load_policy_weights(model, path):
     if not path.is_file():
         raise FileNotFoundError(path)
     weights = _read_policy_weights(path)
-    policy, extra, index = _target_index(model)
+    policy, extra = _policy_layout(model)
+    index = _target_index(model)
     mapped = _compatible_weights(model, weights)
     policy_weights = {
         target: mapped[key] for key, (kind, target) in index.items() if kind == "policy" and key in mapped
