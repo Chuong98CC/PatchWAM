@@ -14,6 +14,7 @@ from torch.nn import functional as F
 from patchwam.checkpoints import load_policy_weights, policy_weight_state
 from patchwam.models import FluxAssetPolicy, joint_visibility, sequence_coordinates
 from patchwam.models.flux import OfficialFluxDenoiser
+from patchwam.models.lora import LowRankResidualLinear
 from patchwam.models.policy import PatchFlowPolicy, make_tiny_policy
 
 REPOSITORY = Path(__file__).resolve().parents[1]
@@ -81,10 +82,6 @@ def write_release(path, source, **changes):
     return path
 
 
-def release_tensor_count(payload):
-    return len(payload["mot"]) + len(payload["proprio_encoder"])
-
-
 def base_name(name):
     """The wrapped ``base`` name of a projection inside a LoRA denoiser."""
     return name[: -len("weight")] + "base.weight" if name.endswith(".weight") else name
@@ -105,7 +102,7 @@ def test_release_layout_loads_every_pretrained_weight(tmp_path):
     assert len(payload["mot"]) > len(source.denoiser.transformer.state_dict())
     path = tmp_path / "step_140000.pt"
     torch.save(payload, path)
-    assert load_policy_weights(destination, path) == {"loaded_tensors": release_tensor_count(payload)}
+    assert load_policy_weights(destination, path) == {"loaded_tensors": len(source.state_dict())}
     for name, tensor in source.state_dict().items():
         torch.testing.assert_close(destination.state_dict()[name], tensor, rtol=0, atol=0)
 
@@ -116,9 +113,11 @@ def test_release_layout_accepts_repeated_block_weights_stored_separately(tmp_pat
     aliases = [key for key in mot_source["mot"] if key.startswith("mixtures.video.") and
                not key.startswith("mixtures.video.transformer.")]
     assert aliases
-    assert all(not torch.equal(mot_source["mot"][key].untyped_storage().data_ptr(),
-                               mot_source["mot"][RELEASE_PREFIX + key[len(RELEASE_ALIAS_ROOT):]]
-                               .untyped_storage().data_ptr()) for key in aliases)
+    assert all(
+        mot_source["mot"][key].untyped_storage().data_ptr()
+        != mot_source["mot"][RELEASE_PREFIX + key[len(RELEASE_ALIAS_ROOT):]].untyped_storage().data_ptr()
+        for key in aliases
+    )
     path = tmp_path / "copies.pt"
     torch.save(mot_source, path)
     destination = patch_policy()
@@ -165,7 +164,13 @@ def test_fresh_lora_adapters_preserve_the_pretrained_denoiser_output(tmp_path):
         "context_ids": sequence_coordinates(2, 4), "visibility": joint_visibility(4, 3, 4, 2),
     }
     with torch.no_grad():
-        torch.testing.assert_close(destination.denoiser(**data), plain.denoiser(**data), rtol=0, atol=0)
+        # Zero-initialized adapters add an exact zero residual; only the float32
+        # GEMM rounding of the frozen bases remains, as in the adapter tests.
+        torch.testing.assert_close(destination.denoiser(**data), plain.denoiser(**data), rtol=1e-5, atol=1e-6)
+        for module in destination.denoiser.transformer.modules():
+            if isinstance(module, LowRankResidualLinear):
+                probe = torch.randn(3, module.base.in_features)
+                torch.testing.assert_close(module(probe), module.base(probe), rtol=0, atol=0)
 
 
 def test_release_layout_initializes_the_wrapped_policy_and_leaves_frozen_assets(tmp_path):

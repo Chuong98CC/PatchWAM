@@ -13,7 +13,10 @@ def main():
     train.add_argument("--config", required=True)
     initialization = train.add_mutually_exclusive_group()
     initialization.add_argument("--resume", help="A complete PatchWAM accelerator state directory")
-    initialization.add_argument("--initialize", help="Load complete native policy safetensors weights")
+    initialization.add_argument(
+        "--initialize",
+        help="Native policy weights from .safetensors, or a tensor-only .pt/.pth state dictionary",
+    )
     train.add_argument("overrides", nargs="*", help="Dotted key=value settings")
     smoke = commands.add_parser("smoke", help="Run a small CPU optimization with a tiny backbone")
     smoke.add_argument("--output", default="runs/smoke")
