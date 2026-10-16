@@ -17,3 +17,6 @@ datasets/
 *.pth
 *.safetensors
 *.mp4
+logs/
+agent-work/
+

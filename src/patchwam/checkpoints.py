@@ -333,6 +333,16 @@ def _read_policy_weights(path):
     )
 
 
+# Legacy custom DiT LoRA tensors and their PEFT LORA destinations. The custom
+# adapter held a low-rank input and output projection; PEFT names the same pair
+# ``lora_A``/``lora_B`` of the emitted module behind a ``base_layer``.
+LEGACY_LORA_DESTINATIONS = {
+    "residual_in": "lora_A.default.weight",
+    "residual_out": "lora_B.default.weight",
+}
+LEGACY_ADAPTER_LEAVES = tuple(f".{leaf}.weight" for leaf in LEGACY_LORA_DESTINATIONS)
+
+
 def _candidate_names(name):
     """Native names a pretrained weight may map to, most specific first."""
     names = [name]
@@ -340,11 +350,24 @@ def _candidate_names(name):
         name[len(POLICY_KEY_PREFIX):] if name.startswith(POLICY_KEY_PREFIX) else POLICY_KEY_PREFIX + name
     )
     for candidate in tuple(names):
+        if ".base." in candidate:
+            # PEFT keeps the pretrained projection behind ``base_layer``.
+            names.append(candidate.replace(".base.", ".base_layer."))
+        for legacy, destination in LEGACY_LORA_DESTINATIONS.items():
+            suffix = f".{legacy}.weight"
+            if candidate.endswith(suffix):
+                names.append(f"{candidate[: -len(suffix)]}.{destination}")
         for leaf in ("weight", "bias"):
             if candidate.endswith("." + leaf):
-                # DiT LoRA keeps each pretrained projection as the frozen ``base``.
+                # PEFT keeps each pretrained projection as the frozen ``base_layer``;
+                # the local ``LowRankResidualLinear`` names it ``base``.
+                names.append(f"{candidate[: -len(leaf)]}base_layer.{leaf}")
                 names.append(f"{candidate[: -len(leaf)]}base.{leaf}")
-    return names
+    return list(dict.fromkeys(names))
+
+
+def _legacy_adapter_names(weights):
+    return sorted(name for name in weights if name.endswith(LEGACY_ADAPTER_LEAVES))
 
 
 def _target_index(model):
@@ -365,6 +388,18 @@ def _compatible_weights(model, weights):
     """Validate every checkpoint tensor against the model before any mutation."""
     index = _target_index(model)
     expected = policy_weight_state(model)
+    unmapped_adapters = [
+        name for name in _legacy_adapter_names(weights)
+        if not any(candidate in index for candidate in _candidate_names(name))
+    ]
+    if unmapped_adapters:
+        raise ValueError(
+            f"{unmapped_adapters[:5]} are custom DiT LoRA adapter tensors that cannot be translated "
+            "to a PEFT LORA adapter of this model. Configure a matching PEFT LORA adapter (dit_lora "
+            "or dit_adapter_config with peft_type LORA) whose rank matches the checkpoint, export the "
+            "weights without adapter tensors, or keep using the checkpoint they came from. Adapter "
+            "tensors are never dropped silently."
+        )
     mapped, missing, unexpected = {}, [], []
     for name, tensor in weights.items():
         target = next((candidate for candidate in _candidate_names(name) if candidate in index), None)
@@ -396,9 +431,14 @@ def load_policy_weights(model, path):
 
     Native ``.safetensors`` files must cover the complete policy state exactly.
     Tensor-only ``.pt``/``.pth`` state dictionaries are read with
-    ``weights_only=True`` and accept either the native schema or the upstream
-    PatchWAM release layout. DiT LoRA adapters are zero initialized and stay
-    fresh, so a base checkpoint that predates them still loads completely.
+    ``weights_only=True`` and accept the native schema, the upstream PatchWAM
+    release layout, or a checkpoint written by the earlier custom DiT LoRA
+    implementation. Pretrained projections land on the PEFT ``base_layer`` and
+    fresh adapters keep their initialization, so a base checkpoint that predates
+    them still loads completely. Legacy custom adapter tensors are translated
+    only when the model carries a PEFT LORA adapter of the same rank at that
+    projection; tensor-only checkpoints do not record ``lora_alpha``, so the
+    configured alpha of the model being loaded remains in force.
     """
     path = Path(path)
     if path.suffix not in (NATIVE_SUFFIX,) + TORCH_SUFFIXES:

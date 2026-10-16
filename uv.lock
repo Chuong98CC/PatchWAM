@@ -661,6 +661,7 @@ dev = [
 ]
 flux = [
     { name = "huggingface-hub" },
+    { name = "peft" },
     { name = "protobuf" },
     { name = "sentencepiece" },
     { name = "transformers" },
@@ -683,6 +684,7 @@ requires-dist = [
     { name = "hydra-core", specifier = "==1.3.2" },
     { name = "numpy", specifier = "==1.26.4" },
     { name = "pandas", specifier = "==2.2.3" },
+    { name = "peft", marker = "extra == 'flux'", specifier = ">=0.19,<1" },
     { name = "pillow", specifier = "==12.0.0" },
     { name = "protobuf", marker = "extra == 'flux'" },
     { name = "protobuf", marker = "extra == 'vlm'" },
@@ -699,6 +701,27 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'vlm'", specifier = "==4.57.1" },
 ]
 provides-extras = ["flux", "vlm", "dev"]
+
+[[package]]
+name = "peft"
+version = "0.21.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "accelerate" },
+    { name = "huggingface-hub" },
+    { name = "numpy" },
+    { name = "packaging" },
+    { name = "psutil" },
+    { name = "pyyaml" },
+    { name = "safetensors" },
+    { name = "torch" },
+    { name = "tqdm" },
+    { name = "transformers" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/80/af/2e08abf1cd3b8792a02f5116808f2398c2f77ecdff801ced2ce16007a6f9/peft-0.21.2.tar.gz", hash = "sha256:b803ccfb3f3f316004d850284306687833a2235ea278fb56abc856203456142e", size = 983614, upload-time = "2026-10-01T10:26:36.129Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/70/0b/59441cdbfdd342ed03c08af90a2fe16173f0cd48ab219f523b39ca059a79/peft-0.21.2-py3-none-any.whl", hash = "sha256:106ab6077ff72c54d21577f9af5970e34bac7582cb14209f7b2b511e322a4eae", size = 835427, upload-time = "2026-10-01T10:26:34.085Z" },
+]
 
 [[package]]
 name = "pillow"

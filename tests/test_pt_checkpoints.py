@@ -1,4 +1,4 @@
-"""Tensor-only PyTorch checkpoints, upstream mapping, and LoRA initialization."""
+"""Tensor-only PyTorch checkpoints, upstream mapping, and PEFT initialization."""
 
 import copy
 import os
@@ -14,7 +14,7 @@ from torch.nn import functional as F
 from patchwam.checkpoints import load_policy_weights, policy_weight_state
 from patchwam.models import FluxAssetPolicy, joint_visibility, sequence_coordinates
 from patchwam.models.flux import OfficialFluxDenoiser
-from patchwam.models.lora import LowRankResidualLinear
+from patchwam.models.lora import is_adapter_layer
 from patchwam.models.policy import PatchFlowPolicy, make_tiny_policy
 
 REPOSITORY = Path(__file__).resolve().parents[1]
@@ -83,8 +83,8 @@ def write_release(path, source, **changes):
 
 
 def base_name(name):
-    """The wrapped ``base`` name of a projection inside a LoRA denoiser."""
-    return name[: -len("weight")] + "base.weight" if name.endswith(".weight") else name
+    """The PEFT ``base_layer`` name of a projection inside an adapted denoiser."""
+    return name[: -len("weight")] + "base_layer.weight" if name.endswith(".weight") else name
 
 
 def snapshot(module):
@@ -133,7 +133,7 @@ def test_release_layout_leaves_lora_adapters_fresh_and_zero(tmp_path):
     adapters = {
         name: parameter.detach().clone()
         for name, parameter in destination.denoiser.transformer.named_parameters()
-        if "residual_in" in name
+        if ".lora_A." in name or ".lora_B." in name
     }
     assert adapters
     load_policy_weights(destination, path)
@@ -141,7 +141,7 @@ def test_release_layout_leaves_lora_adapters_fresh_and_zero(tmp_path):
     for name, tensor in source.denoiser.transformer.state_dict().items():
         target = base_name(name) if base_name(name) in loaded else name
         torch.testing.assert_close(loaded[target], tensor, rtol=0, atol=0)
-    zeros = [name for name, parameter in loaded.items() if name.endswith("residual_out.weight")]
+    zeros = [name for name in loaded if name.endswith("lora_B.default.weight")]
     assert len(zeros) == destination.denoiser.dit_lora_contract()["adapter_targets"]
     assert all(loaded[name].abs().sum() == 0 for name in zeros)
     for name, tensor in adapters.items():
@@ -164,13 +164,15 @@ def test_fresh_lora_adapters_preserve_the_pretrained_denoiser_output(tmp_path):
         "context_ids": sequence_coordinates(2, 4), "visibility": joint_visibility(4, 3, 4, 2),
     }
     with torch.no_grad():
-        # Zero-initialized adapters add an exact zero residual; only the float32
-        # GEMM rounding of the frozen bases remains, as in the adapter tests.
+        # PEFT zero-initializes the LoRA up-projection, so a fresh adapter adds an
+        # exact zero residual; only the float32 GEMM rounding of the frozen base
+        # layers remains, as in the adapter tests.
         torch.testing.assert_close(destination.denoiser(**data), plain.denoiser(**data), rtol=1e-5, atol=1e-6)
         for module in destination.denoiser.transformer.modules():
-            if isinstance(module, LowRankResidualLinear):
-                probe = torch.randn(3, module.base.in_features)
-                torch.testing.assert_close(module(probe), module.base(probe), rtol=0, atol=0)
+            if is_adapter_layer(module):
+                base = module.get_base_layer()
+                probe = torch.randn(3, base.in_features)
+                torch.testing.assert_close(module(probe), base(probe), rtol=0, atol=0)
 
 
 def test_release_layout_initializes_the_wrapped_policy_and_leaves_frozen_assets(tmp_path):

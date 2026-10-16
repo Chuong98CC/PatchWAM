@@ -27,7 +27,7 @@ simulator results require separate verification; see the [verification record](m
 | [Training](training.md) | Overrides, single/multi-node GPU launch, validation, outputs, and resume |
 | [Closed-loop evaluation](evaluation.md) | Simulator setup, action decoding, history reset, seeds, results, and evaluation resume |
 | [Conditioning and training options](conditioning_and_training.md) | VLM, causal histories, CFG, EMA, and the three Self-Flow variants |
-| [Optional DiT LoRA finetuning](dit_lora.md) | Low-rank adapters on frozen block projections, parameter reports, and LoRA checkpoints |
+| [Optional DiT adapter finetuning](dit_lora.md) | PEFT LORA/IA3 adapters on frozen transformer projections, parameter reports, and adapter checkpoints |
 | [Inference](inference.md) | Policy APIs, synthetic and real-observation sampling, and physical action decoding |
 | [Architecture](architecture.md) | Fixed action patches, flow matching, attention, and loss masks |
 | [Development](development.md) | CPU checks, setup troubleshooting, and repository layout |

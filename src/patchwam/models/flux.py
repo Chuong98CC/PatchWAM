@@ -19,17 +19,26 @@ from torch.utils.checkpoint import checkpoint
 from .geometry import flatten_image_latents, raster_coordinates
 from .lora import (
     ADAPTER_PARAMETER_SUFFIXES,
-    LowRankResidualLinear,
+    PEFT_ADAPTER_MARKERS,
+    adapter_parameter_layers,
     adapter_parameter_name,
-    attach_block_adapters,
-    validate_adapter_settings,
+    attach_adapter_layers,
+    build_dit_adapter_config,
+    peft_version,
+    serialized_adapter_config,
+    validated_adapter_options,
 )
+from .lora import freeze_adapter_bases as freeze_peft_adapter_bases
 from .policy import PatchFlowPolicy
 
-# Recorded in the checkpoint contract. Only the wrapped block projection weights
-# are frozen in DiT LoRA mode; every other pretrained DiT parameter, the policy
-# heads, and the adapters train. Any change to this policy must change the marker
-# so an existing LoRA run cannot resume under different optimizer behavior.
+# Recorded in the checkpoint contract. Only the adapted projection weights are
+# frozen in adapter mode; every other pretrained DiT parameter, the policy heads,
+# and the adapter tensors train. Any change to this policy must change the marker so
+# an existing run cannot resume under different optimizer behavior. Adapters also
+# moved from the custom DiT LoRA implementation to PEFT, so a checkpoint recorded
+# under the custom layout cannot resume here even with identical settings.
+DIT_ADAPTER_TRAINING_POLICY = "frozen_peft_adapted_projection_weights_remaining_dit_trainable"
+# Deprecated alias: the custom LoRA marker, kept only to recognize older records.
 DIT_LORA_TRAINING_POLICY = "frozen_wrapped_block_bases_remaining_dit_trainable"
 
 
@@ -40,10 +49,14 @@ def _parameter_layer_name(name: str) -> str:
 
 
 def _adapter_layer_name(name: str) -> str:
-    """The wrapped projection path of an adapter parameter name."""
+    """The adapted projection path of an adapter parameter name."""
     for suffix in ADAPTER_PARAMETER_SUFFIXES:
         if name.endswith(suffix):
             return name[: -len(suffix)]
+    for marker in PEFT_ADAPTER_MARKERS:
+        index = name.find(marker)
+        if index != -1:
+            return name[:index]
     return name
 
 
@@ -85,7 +98,7 @@ class OfficialFluxDenoiser(nn.Module):
     def __init__(
         self, transformer: nn.Module, *, gradient_checkpointing: bool = False,
         dit_lora: bool = False, dit_lora_rank: int = 64, dit_lora_alpha: float = 128,
-        dit_lora_dropout: float = 0.05,
+        dit_lora_dropout: float = 0.05, dit_adapter_config: Any = None,
     ):
         super().__init__()
         model_api = importlib.import_module("flux2.model")
@@ -108,39 +121,70 @@ class OfficialFluxDenoiser(nn.Module):
         self.dit_lora = dit_lora
         self.dit_lora_rank, self.dit_lora_alpha = dit_lora_rank, dit_lora_alpha
         self.dit_lora_dropout = dit_lora_dropout
-        self.lora_targets: list[str] = []
-        if dit_lora:
-            validate_adapter_settings(dit_lora_rank, dit_lora_alpha, dit_lora_dropout, prefix="dit_lora")
-            # Wrapping freezes only each projection's base weight. Every other
+        self.dit_adapter_config = (
+            dict(dit_adapter_config) if isinstance(dit_adapter_config, Mapping) else dit_adapter_config
+        )
+        # A non-empty dit_adapter_config enables PEFT on its own. Without a mapping,
+        # dit_lora builds a LORA config from the legacy flags, and no adapter is
+        # injected when neither is requested.
+        self.adapter_config = build_dit_adapter_config(
+            transformer, dit_adapter_config, dit_lora=dit_lora, rank=dit_lora_rank,
+            alpha=dit_lora_alpha, dropout=dit_lora_dropout,
+        )
+        self.dit_adapter = self.adapter_config is not None
+        self.adapter_targets: list[str] = []
+        if self.adapter_config is not None:
+            # Injection freezes only each adapted projection weight. Every other
             # pretrained DiT parameter keeps its ordinary full-mode training.
-            self.lora_targets = attach_block_adapters(
-                transformer, rank=dit_lora_rank, alpha=dit_lora_alpha, dropout=dit_lora_dropout
-            )
+            self.adapter_targets = attach_adapter_layers(transformer, self.adapter_config)
+
+    @property
+    def lora_targets(self) -> list[str]:
+        """Legacy alias for the adapted projection paths."""
+        return self.adapter_targets
+
+    def dit_adapter_contract(self) -> dict[str, Any] | None:
+        """Effective PEFT adapter settings for the checkpoint contract."""
+        config = self.adapter_config
+        if config is None:
+            return None
+        peft_type = getattr(config.peft_type, "value", config.peft_type)
+        return {
+            "backend": "peft",
+            "peft_type": str(peft_type),
+            "peft_version": peft_version(),
+            "adapter_targets": len(self.adapter_targets),
+            "adapter_layout": str(getattr(config, "adapter_layout", "explicit_target_modules")),
+            "training_policy": DIT_ADAPTER_TRAINING_POLICY,
+            "config": serialized_adapter_config(config),
+        }
 
     def dit_lora_contract(self) -> dict[str, Any] | None:
-        """LoRA settings recorded in the checkpoint contract, or None in full mode."""
-        if not self.dit_lora:
+        """Legacy LORA-shaped view of the effective config, or None.
+
+        Returns a mapping only for the PEFT LORA backend. IA3 runs are described by
+        ``dit_adapter_contract`` so no report or checkpoint calls them LoRA.
+        """
+        config = self.adapter_config
+        if config is None or str(getattr(config.peft_type, "value", config.peft_type)) != "LORA":
             return None
+        contract = self.dit_adapter_contract()
         return {
-            "dit_lora": True, "rank": self.dit_lora_rank, "alpha": self.dit_lora_alpha,
-            "dropout": self.dit_lora_dropout, "adapter_targets": len(self.lora_targets),
-            "adapter_layout": "block_attention_and_mlp_projections",
-            "training_policy": DIT_LORA_TRAINING_POLICY,
+            "dit_lora": True, "rank": config.r, "alpha": config.lora_alpha,
+            "dropout": config.lora_dropout, "adapter_targets": contract["adapter_targets"],
+            "adapter_layout": contract["adapter_layout"],
+            "training_policy": contract["training_policy"],
         }
 
     def freeze_adapter_bases(self):
-        """Freeze the wrapped block projection bases and re-assert adapter training.
+        """Freeze the adapted projection weights and re-assert adapter training.
 
         No other DiT parameter flag is touched, so the remaining pretrained
-        parameters, the policy heads, and the adapters keep training as usual.
+        parameters, the policy heads, and the adapter tensors keep training as usual.
         """
-        if not self.dit_lora:
-            raise ValueError("The denoiser is not configured for DiT LoRA")
-        for module in self.transformer.modules():
-            if isinstance(module, LowRankResidualLinear):
-                module.base.requires_grad_(False)
-                module.residual_in.requires_grad_(True)
-                module.residual_out.requires_grad_(True)
+        if not self.dit_adapter:
+            raise ValueError("The denoiser is not configured for DiT adapters")
+        freeze_peft_adapter_bases(self.transformer)
         return self
 
     @staticmethod
@@ -250,27 +294,32 @@ class FluxAssetPolicy(nn.Module):
         self.history_pool_size = int(history_pool_size)
         # The denoiser owns the frozen DiT contract; the wrapper mirrors it so
         # encoder and checkpoint handling agree with the backbone configuration.
-        self.dit_lora = bool(getattr(policy.denoiser, "dit_lora", False))
+        self.dit_adapter = bool(getattr(policy.denoiser, "dit_adapter", False))
         self.autoencoder.requires_grad_(False).eval()
-        if self.dit_lora or not getattr(self.text_encoder, "requires_images", False):
+        if self.dit_adapter or not getattr(self.text_encoder, "requires_images", False):
             self.text_encoder.requires_grad_(False).eval()
+
+    @property
+    def dit_lora(self) -> bool:
+        """Legacy alias: whether a DiT adapter (any PEFT type) is active."""
+        return self.dit_adapter
 
     def checkpoint_contract(self):
         contract = getattr(self.text_encoder, "checkpoint_contract", None)
         result = {"history_pool_size": self.history_pool_size,
                   "text_encoder": contract() if callable(contract) else type(self.text_encoder).__qualname__}
-        lora = getattr(self.policy.denoiser, "dit_lora_contract", None)
-        settings = lora() if callable(lora) else None
+        adapter = getattr(self.policy.denoiser, "dit_adapter_contract", None)
+        settings = adapter() if callable(adapter) else None
         # Full mode keeps its recorded contract so existing resumes stay valid.
         if settings is not None:
-            result["dit_lora"] = settings
+            result["dit_adapter"] = settings
         return result
 
     def train(self, mode: bool = True):
         super().train(mode)
         self.autoencoder.eval()
-        if self.dit_lora:
-            # Dit LoRA freezes the complete text encoder, including VL adapters.
+        if self.dit_adapter:
+            # DiT adapters freeze the complete text encoder, including VL adapters.
             self.text_encoder.eval()
         elif getattr(self.text_encoder, "requires_images", False):
             self.text_encoder.train(mode)
@@ -281,12 +330,12 @@ class FluxAssetPolicy(nn.Module):
     def freeze_asset_encoders(self):
         """Re-assert frozen assets and encoder modes at the start of a run.
 
-        In DiT LoRA mode this also re-freezes the wrapped adapter bases without
-        changing any other DiT parameter, so only the backbone projections that
-        the adapters replace stay frozen.
+        In DiT adapter mode this also re-freezes the adapted projection weights
+        without changing any other DiT parameter, so only the backbone projections
+        that the adapters replace stay frozen.
         """
         self.autoencoder.requires_grad_(False)
-        if self.dit_lora:
+        if self.dit_adapter:
             self.policy.denoiser.freeze_adapter_bases()
             self.text_encoder.requires_grad_(False)
         return self.train(self.training)
@@ -294,11 +343,12 @@ class FluxAssetPolicy(nn.Module):
     def parameter_report(self) -> dict[str, Any]:
         """Exact named adapter, fully trainable, and frozen policy parameters."""
         buckets: dict[str, list[dict[str, Any]]] = {"adapters": [], "fully_trainable": [], "frozen": []}
+        adapted = adapter_parameter_layers(self) if self.dit_adapter else {}
         for name, parameter in self.named_parameters():
             if not parameter.requires_grad:
                 bucket, layer = "frozen", _parameter_layer_name(name)
-            elif adapter_parameter_name(name):
-                bucket, layer = "adapters", _adapter_layer_name(name)
+            elif name in adapted or adapter_parameter_name(name):
+                bucket, layer = "adapters", adapted.get(name) or _adapter_layer_name(name)
             else:
                 bucket, layer = "fully_trainable", _parameter_layer_name(name)
             buckets[bucket].append(
@@ -330,10 +380,11 @@ class FluxAssetPolicy(nn.Module):
             }
             for scope, group in sorted(groups.items())
         }
+        adapter = getattr(self.policy.denoiser, "dit_adapter_contract", None)
         lora = getattr(self.policy.denoiser, "dit_lora_contract", None)
-        return {
-            "mode": "dit_lora" if self.dit_lora else "full",
-            "dit_lora": (lora() if callable(lora) else None) or {"dit_lora": False},
+        report = {
+            "mode": "dit_adapter" if self.dit_adapter else "full",
+            "dit_adapter": adapter() if callable(adapter) else None,
             **summary,
             "counts": {
                 "adapters": summary["adapters"]["tensor_count"],
@@ -343,6 +394,12 @@ class FluxAssetPolicy(nn.Module):
                 "total": sum(summary[bucket]["tensor_count"] for bucket in ("adapters", "fully_trainable", "frozen")),
             },
         }
+        if getattr(self.policy.denoiser, "adapter_config", None) is None:
+            report["dit_lora"] = {"dit_lora": False}
+        elif (lora() if callable(lora) else None) is not None:
+            # Legacy LORA-shaped mirror; IA3 runs keep only the generic record.
+            report["dit_lora"] = lora()
+        return report
 
     def _encode(self, batch: Mapping[str, Any], *, target: bool) -> dict[str, Any]:
         cache_formats = batch.get("text_cache_format")
@@ -500,21 +557,25 @@ class FluxAssetPolicy(nn.Module):
         vl_auxiliary_weight: float = 0.1, vl_label_smoothing: float = 0.1,
         vl_require_subtasks: bool = False, vl_gradient_checkpointing: bool = True,
         dit_lora: bool = False, dit_lora_rank: int = 64, dit_lora_alpha: float = 128,
-        dit_lora_dropout: float = 0.05,
+        dit_lora_dropout: float = 0.05, dit_adapter_config: dict | None = None,
         **policy_options,
     ) -> "FluxAssetPolicy":
         """Load local assets without downloads or remote code."""
         if type(dit_lora) is not bool:
             raise ValueError("dit_lora must be a boolean")
-        if dit_lora and vl_trainable_adapters:
+        adapter_requested = dit_lora or dit_adapter_config is not None
+        if adapter_requested and vl_trainable_adapters:
             raise ValueError(
-                "dit_lora freezes the complete text encoder, including VL adapters; "
-                "set vl_trainable_adapters=false or disable dit_lora"
+                "DiT adapters freeze the complete text encoder, including VL adapters; "
+                "set vl_trainable_adapters=false or disable the DiT adapter"
             )
         if variant not in {"klein-base-4b", "klein-base-9b"}:
             raise ValueError("variant must be klein-base-4b or klein-base-9b")
-        if dit_lora:
-            validate_adapter_settings(dit_lora_rank, dit_lora_alpha, dit_lora_dropout, prefix="dit_lora")
+        # Reject an unusable adapter request before the (large) assets are loaded.
+        validated_adapter_options(
+            dit_adapter_config, dit_lora=dit_lora, rank=dit_lora_rank, alpha=dit_lora_alpha,
+            dropout=dit_lora_dropout,
+        )
         if dtype not in {"float32", "float16", "bfloat16"}:
             raise ValueError("Unsupported torch dtype")
         if context_length <= 0:
@@ -573,6 +634,7 @@ class FluxAssetPolicy(nn.Module):
         denoiser = OfficialFluxDenoiser(
             transformer, gradient_checkpointing=gradient_checkpointing, dit_lora=dit_lora,
             dit_lora_rank=dit_lora_rank, dit_lora_alpha=dit_lora_alpha, dit_lora_dropout=dit_lora_dropout,
+            dit_adapter_config=dit_adapter_config,
         )
         policy = PatchFlowPolicy(
             denoiser, action_dim=action_dim, text_dim=config.context_in_dim, proprio_dim=proprio_dim,

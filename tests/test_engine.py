@@ -1,5 +1,7 @@
 import json
+import random
 
+import numpy as np
 import pytest
 import torch
 from torch import nn
@@ -59,6 +61,63 @@ def test_interrupted_training_restores_model_optimizer_scheduler_and_rng(tmp_pat
     assert resumed.scheduler.state_dict() == baseline.scheduler.state_dict()
     for key, value in resumed.model.state_dict().items():
         torch.testing.assert_close(value, expected[key], rtol=0, atol=0)
+
+
+def test_resume_restores_the_exact_python_numpy_and_torch_random_streams(tmp_path):
+    """Continuation reloads every random stream Accelerate saved (torch >= 2.6)."""
+    source = make_run(tmp_path / "source")
+    source.train()
+    path = tmp_path / "source" / "step_0000004"
+    expected_python, expected_numpy = random.getstate(), np.random.get_state()
+    expected_torch = torch.get_rng_state()
+
+    resumed = make_run(tmp_path / "resumed")
+    random.random(), np.random.rand(4), torch.rand(4)
+    resumed.restore(path)
+
+    assert random.getstate() == expected_python
+    numpy_state = np.random.get_state()
+    assert numpy_state[0] == expected_numpy[0]
+    assert np.array_equal(numpy_state[1], expected_numpy[1])
+    assert tuple(numpy_state[2:]) == tuple(expected_numpy[2:])
+    assert torch.equal(torch.get_rng_state(), expected_torch)
+
+
+@pytest.mark.parametrize("damage, message", [
+    ("missing", "is missing"),
+    ("corrupt", "weights_only"),
+    ("unsafe", "weights_only"),
+])
+def test_resume_rejects_an_unusable_random_state_without_an_unsafe_fallback(tmp_path, damage, message):
+    original = make_run(tmp_path / "original")
+    path = original.checkpoint(0, 0)
+    states = path / "random_states_0.pkl"
+    if damage == "missing":
+        states.unlink()
+    elif damage == "corrupt":
+        states.write_bytes(b"not a torch state dictionary")
+    else:
+        torch.save({"module": nn.Linear(2, 2)}, states)
+    with pytest.raises(ValueError, match=message):
+        make_run(tmp_path / "resumed").restore(path)
+
+
+def test_resume_refuses_a_process_with_weights_only_loading_disabled(tmp_path, monkeypatch):
+    original = make_run(tmp_path / "original")
+    path = original.checkpoint(0, 0)
+    monkeypatch.setenv("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
+    with pytest.raises(ValueError, match="weights-only"):
+        make_run(tmp_path / "resumed").restore(path)
+
+
+def test_a_random_state_that_was_not_restored_is_reported(tmp_path):
+    from patchwam.checkpoints import read_rng_state, require_restored_rng_state
+
+    states = read_rng_state(make_run(tmp_path).checkpoint(0, 0), 0)
+    require_restored_rng_state(states)
+    torch.rand(1)
+    with pytest.raises(ValueError, match="torch CPU generator"):
+        require_restored_rng_state(states)
 
 
 def test_partial_accumulation_at_epoch_end_is_saved(tmp_path):

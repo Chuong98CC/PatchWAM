@@ -1,5 +1,6 @@
 """Native policy initialization and frozen-asset checkpoint coverage."""
 
+import copy
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +10,11 @@ from torch import nn
 
 from patchwam.checkpoints import load_policy_weights, register_compact_policy_state
 from patchwam.models import make_tiny_policy
+from patchwam.models.lora import LowRankResidualLinear, attach_block_adapters
+
+
+def tensor_only_copy(model):
+    return {key: value.detach().clone() for key, value in model.state_dict().items()}
 
 
 def weight_copy(policy):
@@ -62,6 +68,164 @@ def test_policy_initialization_rejects_unsupported_formats(tmp_path, extension):
 def test_missing_policy_weight_file_reports_its_path(tmp_path):
     with pytest.raises(FileNotFoundError):
         load_policy_weights(make_tiny_policy(), tmp_path / "weights.pt")
+
+
+@pytest.mark.parametrize("suffix", [".pt", ".pth"])
+def test_tensor_only_checkpoint_initializes_the_complete_policy(tmp_path, suffix):
+    source, destination = make_tiny_policy(), make_tiny_policy()
+    path = tmp_path / ("policy" + suffix)
+    torch.save(tensor_only_copy(source), path)
+    assert load_policy_weights(destination, path) == {"loaded_tensors": len(source.state_dict())}
+    for name, value in destination.state_dict().items():
+        torch.testing.assert_close(value, source.state_dict()[name], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("damage, message", [
+    ("unsafe", "weights_only"),
+    ("missing", "Incomplete"),
+    ("unexpected", "Incomplete"),
+])
+def test_tensor_only_checkpoints_are_rejected_atomically(tmp_path, damage, message):
+    source, destination = make_tiny_policy(), make_tiny_policy()
+    before = weight_copy(destination)
+    weights = tensor_only_copy(source)
+    if damage == "unsafe":
+        payload = {"policy": nn.Linear(2, 2)}
+    elif damage == "missing":
+        del weights[next(iter(weights))]
+        payload = weights
+    else:
+        payload = weights | {"unrecognized.weight": torch.ones(1)}
+    path = tmp_path / "invalid.pt"
+    torch.save(payload, path)
+    with pytest.raises(ValueError, match=message):
+        load_policy_weights(destination, path)
+    for name, value in destination.state_dict().items():
+        torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+
+
+class _ContractBlock(nn.Module):
+    def __init__(self, width):
+        super().__init__()
+        self.qkv = nn.Linear(width, width * 3, bias=False)
+        self.proj = nn.Linear(width, width, bias=False)
+        self.linear1 = nn.Linear(width, width * 2, bias=False)
+        self.linear2 = nn.Linear(width * 2, width, bias=False)
+
+
+class ContractTransformer(nn.Module):
+    """The official block contract: projections named qkv/proj/linear1/linear2."""
+
+    def __init__(self, width=8):
+        super().__init__()
+        self.double_blocks = nn.ModuleList([_ContractBlock(width)])
+        self.single_blocks = nn.ModuleList([_ContractBlock(width)])
+        self.img_in = nn.Linear(width, width, bias=False)
+
+
+def test_tensor_only_base_weights_fill_lora_projections_and_leave_adapters_fresh(tmp_path):
+    """A frozen-base checkpoint initializes the PEFT LORA projections on the local CPU."""
+    torch.manual_seed(11)
+    plain, destination = ContractTransformer(), ContractTransformer()
+    attach_block_adapters(destination, rank=2, alpha=4, dropout=0)
+    adapters = {
+        name: value.detach().clone()
+        for name, value in destination.state_dict().items()
+        if ".lora_A." in name
+    }
+    assert adapters
+    path = tmp_path / "base.pt"
+    torch.save(tensor_only_copy(plain), path)
+    assert load_policy_weights(destination, path) == {"loaded_tensors": len(plain.state_dict())}
+    loaded = destination.state_dict()
+    for name, value in plain.state_dict().items():
+        wrapped = name[: -len("weight")] + "base_layer.weight" if name.endswith(".weight") else name
+        target = wrapped if wrapped in loaded else name
+        torch.testing.assert_close(loaded[target], value, rtol=0, atol=0)
+    # Block projections moved behind their frozen base layer; the rest stayed put.
+    assert "double_blocks.0.qkv.weight" not in loaded and "img_in.base_layer.weight" not in loaded
+    for name, value in adapters.items():
+        torch.testing.assert_close(loaded[name], value, rtol=0, atol=0)
+    zeros = [name for name in loaded if name.endswith("lora_B.default.weight")]
+    assert zeros and all(loaded[name].abs().sum() == 0 for name in zeros)
+
+
+def test_legacy_custom_lora_tensors_initialize_the_peft_adapter(tmp_path):
+    """A checkpoint from the custom DiT LoRA path converts without losing tensors."""
+    torch.manual_seed(13)
+    plain = ContractTransformer()
+    legacy = copy.deepcopy(plain)
+    wrapped = {}
+    for name, module in list(legacy.named_modules()):
+        if isinstance(module, nn.Linear) and name.split(".")[0] in {"double_blocks", "single_blocks"}:
+            parent_name, _, attribute = name.rpartition(".")
+            parent = legacy.get_submodule(parent_name)
+            adapter = LowRankResidualLinear(module, rank=2, alpha=4, dropout=0)
+            with torch.no_grad():
+                adapter.residual_in.weight.fill_(0.25)
+                adapter.residual_out.weight.fill_(0.5)
+            setattr(parent, attribute, adapter)
+            wrapped[name] = adapter
+    assert wrapped
+    path = tmp_path / "legacy.safetensors"
+    save_file(tensor_only_copy(legacy), str(path))
+
+    destination = ContractTransformer()
+    attach_block_adapters(destination, rank=2, alpha=4, dropout=0)
+    assert load_policy_weights(destination, path) == {"loaded_tensors": len(legacy.state_dict())}
+    converted = destination.state_dict()
+    for name, adapter in wrapped.items():
+        torch.testing.assert_close(
+            converted[f"{name}.lora_A.default.weight"], adapter.residual_in.weight, rtol=0, atol=0,
+        )
+        torch.testing.assert_close(
+            converted[f"{name}.lora_B.default.weight"], adapter.residual_out.weight, rtol=0, atol=0,
+        )
+        torch.testing.assert_close(
+            converted[f"{name}.base_layer.weight"], adapter.base.weight, rtol=0, atol=0,
+        )
+
+
+def test_legacy_custom_lora_tensors_are_rejected_when_no_peft_adapter_matches(tmp_path):
+    """Adapter tensors are never dropped silently when the target layout differs."""
+    torch.manual_seed(17)
+    legacy = ContractTransformer()
+    legacy.double_blocks[0].qkv = LowRankResidualLinear(legacy.double_blocks[0].qkv, rank=2, alpha=4, dropout=0)
+    path = tmp_path / "legacy.safetensors"
+    save_file(tensor_only_copy(legacy), str(path))
+    plain_destination = ContractTransformer()
+    before = tensor_only_copy(plain_destination)
+    with pytest.raises(ValueError, match="custom DiT LoRA adapter tensors"):
+        load_policy_weights(plain_destination, path)
+    for name, value in plain_destination.state_dict().items():
+        torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+    # A different rank at the same projection is a shape conflict, not a silent skip.
+    mismatched = ContractTransformer()
+    attach_block_adapters(mismatched, rank=3, alpha=4, dropout=0)
+    with pytest.raises(ValueError, match="shape"):
+        load_policy_weights(mismatched, path)
+
+
+def test_native_peft_ia3_checkpoint_round_trips_without_a_wrapper(tmp_path):
+    """IA3 tensors save and load exactly through the policy state dictionary."""
+    from patchwam.models.lora import attach_adapter_layers, build_dit_adapter_config
+
+    torch.manual_seed(23)
+    source, destination = ContractTransformer(), ContractTransformer()
+    for model in (source, destination):
+        attach_adapter_layers(model, build_dit_adapter_config(model, {"peft_type": "IA3"}))
+    assert any(name.endswith(".ia3_l.default") for name in source.state_dict())
+    # Low-level injection keeps the policy state dictionary flat: no PeftModel
+    # wrapper and no duplicated base-model parameters.
+    assert not any("base_model" in name for name in source.state_dict())
+    with torch.no_grad():
+        source.double_blocks[0].qkv.ia3_l["default"].fill_(1.5)
+    path = tmp_path / "ia3.safetensors"
+    save_file(tensor_only_copy(source), str(path))
+    assert load_policy_weights(destination, path) == {"loaded_tensors": len(source.state_dict())}
+    for name, value in destination.state_dict().items():
+        torch.testing.assert_close(value, source.state_dict()[name], rtol=0, atol=0)
+    assert destination.double_blocks[0].qkv.ia3_l["default"].flatten()[0].item() == 1.5
 
 
 class HookHarness:

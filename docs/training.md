@@ -197,13 +197,25 @@ experiment, initialize weights into a fresh run instead.
 The saved `cursor.json` carries the run signature, dataset signature, update count,
 world size, and continuation cursor used to check that contract before loading.
 
+Resume reads saved random states using weights-only deserialization with a scoped NumPy allowlist and verifies that the random streams were restored. Remove `TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD` if it is set; unsafe loading is refused.
+
 Exact CPU continuation is verified with `training.workers=0`. Prefetched asynchronous
 worker state is not saved, so mid-epoch continuation with multiple workers can
 produce different augmentation draws.
 
+`scripts/train.sh` launches the RobotWin 5-task DiT adapter recipe with the release
+checkpoint. Set `RESUME_CHECKPOINT=/shared/runs/robotwin/step_0005000` to continue
+that run instead; the launcher then passes `--resume` and never both flags.
+`PRETRAINED_MODEL` overrides the default initialization file.
+
+DiT adapters use Hugging Face PEFT, which is part of the optional `flux` extra:
+`uv sync --extra flux` (or `pip install -e '.[flux]'`). Full finetuning, the
+default, does not import PEFT at all.
+
 ### Initialize policy weights
 
-`--initialize` loads complete native policy weights into a new optimization run:
+`--initialize` loads policy weights into a new optimization run. It accepts native
+`.safetensors` files and tensor-only `.pt`/`.pth` state dictionaries:
 
 ```bash
 accelerate launch --config_file /path/to/ddp.yaml \
@@ -217,4 +229,40 @@ The loader checks every parameter name, shape, and floating-point value before
 changing the policy. It initializes the trainable transformer and state projection;
 the frozen encoder assets must still be supplied separately. Optimizer, scheduler,
 RNG, and EMA averaging states start fresh. `--initialize` and `--resume` are mutually exclusive.
-Historical checkpoint formats require a separate validated conversion to the native schema.
+
+PyTorch files are read with `torch.load(..., weights_only=True, map_location="cpu")`,
+so a file that needs pickled classes is rejected instead of executed. There is no
+fallback to unsafe deserialization, and unsupported layouts fail with the recognized
+names named in the error. Two layouts are accepted:
+
+| Layout | Contents | Mapping |
+| --- | --- | --- |
+| Native state dictionary | Model keys such as `denoiser.transformer.*` and `state_projection.*` | Loaded as stored |
+| Upstream release checkpoint | `mot`, `proprio_encoder`, `step`, and `torch_dtype` | `mixtures.video.transformer.*` to `denoiser.transformer.*`, and `proprio_encoder.{weight,bias}` to `state_projection.{weight,bias}` |
+
+The upstream layout repeats the block weights under a bare `mixtures.video` prefix.
+Those copies are checked against the transformer weights, including their shared
+storage, before anything is written. The shipped RobotWin C2R checkpoint is an
+upstream file, so fine-tuning starts directly from it:
+
+```bash
+accelerate launch --multi_gpu --num_machines 1 --num_processes 4 --mixed_precision bf16 \
+  -m patchwam.cli train --config configs/robotwin_vlm_5tasks.yaml \
+  --initialize Pretrained_models/patchwam-robotwin/step_140000.pt \
+  model.dit_lora=true model.dit_lora_rank=64 model.dit_lora_alpha=128 model.dit_lora_dropout=0.05 \
+  training.output_dir=runs/robotwin-vlm-dit-lora-5tasks
+```
+
+With DiT LoRA enabled, the pretrained block projections initialize the frozen
+`base_layer` weights of the adapted projections. The adapters themselves are absent
+from the release checkpoint and stay fresh: `lora_A` keeps its kaiming
+initialization and `lora_B` stays zero, so each adapted layer computes the
+pretrained projection exactly until training moves the adapters. Every other
+pretrained transformer weight and the state projection are required, so an
+incomplete or mismatched checkpoint fails before any parameter changes. A
+checkpoint written by the earlier custom DiT LoRA implementation converts as well:
+its `base`/`residual_in`/`residual_out` tensors map onto
+`base_layer`/`lora_A`/`lora_B` when the run configures a PEFT LORA adapter of the
+same rank. Historical checkpoint formats outside these layouts still require a
+separate validated conversion. See [DiT adapters](dit_lora.md) for the adapter
+families and the `dit_adapter_config` mapping.
