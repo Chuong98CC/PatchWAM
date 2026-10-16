@@ -20,3 +20,4 @@ datasets/
 logs/
 agent-work/
 
+uv.lock
