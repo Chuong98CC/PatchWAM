@@ -18,8 +18,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 
-__all__ = ["build_task_table", "episode_task_names", "normalize_task_selection",
-           "resolve_episode_tasks"]
+__all__ = ["build_task_table", "episode_range_selection", "episode_task_names",
+           "expected_episode_count", "mapped_episode_indices",
+           "normalize_task_selection", "resolve_episode_tasks"]
+
+#: Recognised keys of the opt-in ``task_selection`` mapping.
+SELECTION_KEYS = {"tasks", "episode_ranges", "expected_episodes"}
 
 
 def normalize_task_selection(task_selection):
@@ -35,9 +39,11 @@ def normalize_task_selection(task_selection):
             "task_selection must be a mapping with a 'tasks' list, received "
             f"{type(task_selection).__name__}"
         )
-    unknown = sorted(str(key) for key in set(task_selection) - {"tasks"})
+    unknown = sorted(str(key) for key in set(task_selection) - SELECTION_KEYS)
     if unknown:
         raise ValueError(f"Unknown task selection options: {unknown}")
+    if "expected_episodes" in task_selection and "episode_ranges" not in task_selection:
+        raise ValueError("expected_episodes only applies to an episode_ranges selection")
     if "tasks" not in task_selection:
         raise ValueError("Task selection requires an explicit 'tasks' list of exact task names")
     requested = task_selection["tasks"]
@@ -56,6 +62,90 @@ def normalize_task_selection(task_selection):
     if not names:
         raise ValueError("Task selection requires at least one task name")
     return tuple(names)
+
+
+def _mapped_intervals(name, raw, seen):
+    """Validate one task's half-open ``[start, end)`` episode intervals."""
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence) or not raw:
+        raise ValueError(
+            f"episode_ranges[{name!r}] must be a nonempty list of [start, end) pairs")
+    intervals = []
+    for item in raw:
+        if (isinstance(item, (str, bytes)) or not isinstance(item, Sequence) or len(item) != 2
+                or any(type(value) is not int for value in item)):
+            raise ValueError(
+                f"episode_ranges[{name!r}] entries must be two integers, received {item!r}")
+        start, end = int(item[0]), int(item[1])
+        if start < 0 or end <= start:
+            raise ValueError(
+                f"episode_ranges[{name!r}] needs 0 <= start < end, received {[start, end]!r}")
+        if any(start < other_end and other_start < end for other_start, other_end in seen):
+            raise ValueError(
+                f"episode_ranges[{name!r}] interval [{start}, {end}) overlaps another "
+                "mapped range")
+        seen.append((start, end))
+        intervals.append((start, end))
+    return sorted(intervals)
+
+
+def episode_range_selection(task_selection, requested):
+    """Validated ``task -> half-open episode-index intervals`` map, or None.
+
+    The RoboTwin 2.0 release ships instruction paraphrases instead of benchmark
+    names: one episode declares dozens of instruction variants, so exact-name
+    resolution cannot identify a benchmark task. This explicit map defines
+    benchmark identity by root-local episode index and never reads the
+    instruction text. Returns ``None`` when no map is configured, which keeps
+    the exact-name mode for datasets whose metadata names a single task.
+    """
+    if task_selection is None or not isinstance(task_selection, Mapping):
+        return None
+    ranges = task_selection.get("episode_ranges")
+    if ranges is None:
+        return None
+    if not isinstance(ranges, Mapping):
+        raise ValueError(
+            "episode_ranges must map each requested task name to intervals, received "
+            f"{type(ranges).__name__}")
+    names = set(requested)
+    if set(ranges) != names:
+        missing = sorted(names - set(ranges))
+        extra = sorted(str(name) for name in set(ranges) - names)
+        raise ValueError(
+            f"episode_ranges must name exactly the requested tasks: missing {missing}, "
+            f"extra {extra}")
+    seen = []
+    validated = {}
+    for name in requested:
+        validated[name] = _mapped_intervals(name, ranges[name], seen)
+    return validated
+
+
+def expected_episode_count(task_selection):
+    """Optional ``expected_episodes`` guard for a mapped selection."""
+    if task_selection is None or not isinstance(task_selection, Mapping):
+        return None
+    if "expected_episodes" not in task_selection:
+        return None
+    expected = task_selection["expected_episodes"]
+    if expected is None:
+        return None
+    if type(expected) is not int or expected < 1:
+        raise ValueError("expected_episodes must be a positive integer")
+    return expected
+
+
+def mapped_episode_indices(ranges, total_episodes, root):
+    """Flatten a validated range map to sorted episode indices, checking bounds."""
+    indices = []
+    for name in sorted(ranges):
+        for start, end in ranges[name]:
+            if end > total_episodes:
+                raise ValueError(
+                    f"episode_ranges[{name!r}] interval [{start}, {end}) exceeds the "
+                    f"{total_episodes} episodes declared by {root}")
+            indices.extend(range(start, end))
+    return sorted(set(indices))
 
 
 def build_task_table(rows):

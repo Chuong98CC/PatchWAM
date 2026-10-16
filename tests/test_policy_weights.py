@@ -52,10 +52,16 @@ def test_invalid_policy_weights_do_not_change_any_parameters(tmp_path, damage):
         torch.testing.assert_close(value, before[name], rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("extension", [".pt", ".bin"])
-def test_policy_initialization_requires_safetensors(tmp_path, extension):
+@pytest.mark.parametrize("extension", [".bin", ".ckpt"])
+def test_policy_initialization_rejects_unsupported_formats(tmp_path, extension):
+    """Tensor-only .pt/.pth files are supported; other formats stay rejected."""
     with pytest.raises(ValueError, match="native .safetensors"):
         load_policy_weights(make_tiny_policy(), tmp_path / ("weights" + extension))
+
+
+def test_missing_policy_weight_file_reports_its_path(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        load_policy_weights(make_tiny_policy(), tmp_path / "weights.pt")
 
 
 class HookHarness:

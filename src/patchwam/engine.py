@@ -290,7 +290,19 @@ class OptimizationRun:
             raise ValueError("Continuation cursor exceeds the epoch")
         if cursor[2] % self.settings.accumulation:
             raise ValueError("Continuation must start at an accumulation boundary")
-        self.accelerator.load_state(str(directory))
+        from .checkpoints import read_rng_state, require_restored_rng_state, safe_rng_state_loading
+
+        # Read the random state first so an unreadable file reports itself
+        # instead of failing inside Accelerator as a bare KeyError.
+        error = None
+        try:
+            states = read_rng_state(directory, self.accelerator.process_index)
+        except Exception as caught:  # noqa: BLE001 - every rank must observe a failed state read
+            error = caught
+        self._propagate_failure(error, "reading the saved random state")
+        with safe_rng_state_loading():
+            self.accelerator.load_state(str(directory))
+        require_restored_rng_state(states)
         if self.ema is not None and self.ema.updates != metadata["updates"]:
             raise ValueError("EMA update count differs from the training continuation cursor")
         self.updates = metadata["updates"]

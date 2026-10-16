@@ -31,7 +31,9 @@ from .cameras import compose_cameras, prepare_rgb, resize_clip
 from .history import PastFrameSelector
 from .processing import SampleProcessor
 from .scaling import read_statistics
-from .task_selection import build_task_table, normalize_task_selection, resolve_episode_tasks
+from .task_selection import (build_task_table, episode_range_selection, expected_episode_count,
+                             mapped_episode_indices, normalize_task_selection,
+                             resolve_episode_tasks)
 
 
 @dataclass
@@ -107,12 +109,13 @@ def _apply_episode_filter(indices, episode_index_filter):
     return indices
 
 
-def _plan_root(root, episode_index_filter):
+def _plan_root(root, episode_index_filter, mapped=None, expected_episodes=None):
     """Read one root's metadata and apply the episode-index filter.
 
     With a task selector active the plan is built for every configured root
     before any train/validation partition, so candidate validation cannot be
-    decided by which roots a split happened to keep.
+    decided by which roots a split happened to keep. ``mapped`` supplies the
+    explicit benchmark episode ranges, which bypass instruction identity.
     """
     info = json.loads((root / "meta/info.json").read_text(encoding="utf-8"))
     if str(info.get("codebase_version", "v2")).startswith("v3"):
@@ -120,13 +123,24 @@ def _plan_root(root, episode_index_filter):
     root_fps = float(info["fps"])
     if not np.isfinite(root_fps) or root_fps <= 0:
         raise ValueError(f"Dataset FPS must be finite and positive: {root}")
+    task_rows = _json_lines(root / "meta/tasks.jsonl")
+    tasks = {int(item["task_index"]): item["task"] for item in task_rows}
+    if mapped is not None:
+        # Benchmark identity comes from the explicit map, so instruction
+        # metadata is never read or interpreted in this mode.
+        total = int(info["total_episodes"])
+        if expected_episodes is not None and total != expected_episodes:
+            raise ValueError(
+                f"{root} declares {total} episodes but the selection expects "
+                f"{expected_episodes}")
+        indices = _apply_episode_filter(
+            mapped_episode_indices(mapped, total, root), episode_index_filter)
+        return _RootPlan(info, indices, tasks, {}, selected=list(indices))
     episode_meta = _json_lines(root / "meta/episodes.jsonl")
     indices = sorted(int(item["episode_index"]) for item in episode_meta)
     if not indices:
         indices = list(range(int(info["total_episodes"])))
     indices = _apply_episode_filter(indices, episode_index_filter)
-    task_rows = _json_lines(root / "meta/tasks.jsonl")
-    tasks = {int(item["task_index"]): item["task"] for item in task_rows}
     entries = {int(item["episode_index"]): item for item in episode_meta}
     return _RootPlan(info, indices, tasks, entries)
 
@@ -209,19 +223,35 @@ class EpisodeDataset(Dataset):
         self.task_selection = None
         selected_episodes = {}
         plans = []
+        mapped, expected_episodes = None, None
         if requested_tasks is not None:
             wanted = set(requested_tasks)
-            declared, present = set(), set()
-            for root in roots:
-                plan = _plan_root(root, episode_index_filter)
-                table = build_task_table(_json_lines(root / "meta/tasks.jsonl"))
-                declared |= set(table.values())
-                resolved = resolve_episode_tasks(
-                    plan.indices, plan.entries, table, root,
-                    parquet_task_indices=partial(_episode_parquet_task_indices, root, plan.info),
+            mapped = episode_range_selection(task_selection, requested_tasks)
+            expected_episodes = expected_episode_count(task_selection)
+            if mapped is not None and len(roots) != 1:
+                raise ValueError(
+                    "episode_ranges map root-local episode indices, so exactly one dataset "
+                    f"root is supported, received {len(roots)}"
                 )
-                present |= set(resolved.values())
-                plan.selected = [index for index in plan.indices if resolved[index] in wanted]
+            declared = set(mapped) if mapped is not None else set()
+            present = set()
+            for root in roots:
+                plan = _plan_root(root, episode_index_filter, mapped, expected_episodes)
+                if mapped is None:
+                    table = build_task_table(_json_lines(root / "meta/tasks.jsonl"))
+                    declared |= set(table.values())
+                    resolved = resolve_episode_tasks(
+                        plan.indices, plan.entries, table, root,
+                        parquet_task_indices=partial(_episode_parquet_task_indices, root, plan.info),
+                    )
+                    present |= set(resolved.values())
+                    plan.selected = [index for index in plan.indices
+                                     if resolved[index] in wanted]
+                else:
+                    kept = plan.indices
+                    present |= {name for name, intervals in mapped.items()
+                                if any(start <= index < end for index in kept
+                                       for start, end in intervals)}
                 plans.append(plan)
             absent = [name for name in requested_tasks
                       if name not in declared and name not in present]
@@ -232,10 +262,11 @@ class EpisodeDataset(Dataset):
                 )
             starved = [name for name in requested_tasks if name not in present]
             if starved:
+                detail = ("its mapped episodes were removed by the episode-index filter"
+                          if mapped is not None else "no retained episode declares it")
                 raise ValueError(
                     f"Requested tasks have no candidate episodes after the episode-index filter: "
-                    f"{starved}. Every name is declared in meta/tasks.jsonl, but no retained "
-                    "episode uses it"
+                    f"{starved}. Every name is declared, but {detail}"
                 )
         if val_set_proportion and val_split_level == "root":
             selected = np.arange(len(roots))
@@ -293,6 +324,10 @@ class EpisodeDataset(Dataset):
         if requested_tasks is not None:
             self.task_selection = {"tasks": list(requested_tasks),
                                    "selected_episodes": selected_episodes}
+            if mapped is not None:
+                self.task_selection["episode_ranges"] = {
+                    name: [[start, end] for start, end in intervals]
+                    for name, intervals in mapped.items()}
         if len(fps) != 1:
             raise ValueError(f"Dataset roots must share FPS, received {sorted(fps)}")
         if not self.episodes:

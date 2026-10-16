@@ -1,0 +1,4 @@
+wrapped-base freeze effect: False 3.5762786865234375e-07
+adapters bitwise inert: True 20
+frozen tensors: 20 of 81
+frozen non-base tensors: []

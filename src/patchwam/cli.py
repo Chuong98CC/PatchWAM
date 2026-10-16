@@ -13,7 +13,10 @@ def main():
     train.add_argument("--config", required=True)
     initialization = train.add_mutually_exclusive_group()
     initialization.add_argument("--resume", help="A complete PatchWAM accelerator state directory")
-    initialization.add_argument("--initialize", help="Load complete native policy safetensors weights")
+    initialization.add_argument(
+        "--initialize",
+        help="Native policy weights from .safetensors, or a tensor-only .pt/.pth state dictionary",
+    )
     train.add_argument("overrides", nargs="*", help="Dotted key=value settings")
     smoke = commands.add_parser("smoke", help="Run a small CPU optimization with a tiny backbone")
     smoke.add_argument("--output", default="runs/smoke")
@@ -73,6 +76,14 @@ def main():
             path = Path(settings.output_dir, "configuration.yaml")
             if not path.exists():
                 path.write_text(OmegaConf.to_yaml(config))
+            report = getattr(model, "parameter_report", None)
+            if callable(report):
+                parameters = report()
+                report_path = Path(settings.output_dir, "parameter_report.json")
+                if not report_path.exists():
+                    report_path.write_text(json.dumps(parameters, indent=2) + "\n")
+                print(json.dumps({"parameter_report": parameters["counts"], "mode": parameters["mode"]}),
+                      flush=True)
 
         run._on_main("record configuration", record_configuration)
     else:
