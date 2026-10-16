@@ -1,11 +1,13 @@
 # Five-task RoboTwin-Clean ablation of robotwin_vlm.yaml.
 #
-# This is a full standalone copy of configs/robotwin_vlm.yaml, because the
-# loader merges a dotlist over one file and does not resolve YAML defaults.
-# Model, conditioning, augmentation, horizon, dimensions, optimizer, five
-# epochs, LR and batch settings are unchanged; only the task roots, the
-# normalization-statistics default, the (absent) non-idle row filter, the asset
-# paths and the output directory differ.
+# This standalone config is based on configs/robotwin_vlm.yaml; the loader
+# merges command-line overrides over one file and does not resolve YAML defaults.
+# Optimization: 100 epochs capped at 150000 optimizer updates.
+# Launch topology: 1 node x 4 GPUs = 4 data-parallel ranks.
+# Global batch: 4 samples per GPU x 16 accumulation steps x 4 ranks = 256.
+# The engine uses cosine scheduling with the warmup and floor configured below.
+# Reference checkpoint step: 140000; to resume, pass --resume with an actual
+# training-state checkpoint path. This comment does not enable automatic resume.
 #
 # Each task ships as its own LeRobot v2.1 root under the parent directory, so
 # `data.dataset_dirs` *is* the task filter and no `data.task_selection` is used.
@@ -143,10 +145,10 @@ data:
   include_vl_inputs: true
 training:
   output_dir: runs/robotwin_vlm_5tasks
-  epochs: 5
-  max_updates: null
+  epochs: 100
+  max_updates: 150000
   batch_size: 4
-  accumulation: 2
+  accumulation: 16
   learning_rate: 0.0001
   weight_decay: 0.01
   precision: bf16

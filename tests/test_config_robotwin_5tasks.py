@@ -32,7 +32,7 @@ def environment(monkeypatch):
     return ENVIRONMENT
 
 
-def test_five_task_config_is_the_source_recipe_plus_the_task_roots(environment):
+def test_five_task_config_preserves_source_with_requested_training(environment):
     source = OmegaConf.to_container(
         read_configuration(CONFIG_DIR / "robotwin_vlm.yaml"), resolve=True)
     subset = OmegaConf.to_container(
@@ -40,7 +40,11 @@ def test_five_task_config_is_the_source_recipe_plus_the_task_roots(environment):
     assert list(subset["data"]["dataset_dirs"]) == FIVE_ROOTS
     assert "task_selection" not in subset["data"]
     assert subset["training"]["output_dir"] == "runs/robotwin_vlm_5tasks"
-    subset["training"]["output_dir"] = source["training"]["output_dir"]
+    expected_training = dict(source["training"], output_dir="runs/robotwin_vlm_5tasks",
+                             epochs=100, max_updates=150000, batch_size=4, accumulation=16)
+    assert subset["training"] == expected_training
+    assert subset["training"]["batch_size"] * subset["training"]["accumulation"] * 4 == 256
+    subset["training"] = source["training"]
     subset["data"]["dataset_dirs"] = source["data"]["dataset_dirs"]
     subset["data"]["nonidle_filter_path"] = source["data"]["nonidle_filter_path"]
     subset["data"]["pretrained_norm_stats"] = source["data"]["pretrained_norm_stats"]
