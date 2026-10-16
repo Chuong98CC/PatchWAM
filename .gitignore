@@ -17,3 +17,4 @@ datasets/
 *.pth
 *.safetensors
 *.mp4
+uv.lock
