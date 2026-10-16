@@ -1,0 +1,27 @@
+F                                                                        [100%]
+=================================== FAILURES ===================================
+___ test_adapter_injection_is_zero_initialized_and_leaves_the_rest_trainable ___
+
+    def test_adapter_injection_is_zero_initialized_and_leaves_the_rest_trainable():
+        plain = OfficialFluxDenoiser(official_core())
+        untouched = copy.deepcopy(plain.transformer)
+        adapted = OfficialFluxDenoiser(copy.deepcopy(plain.transformer), **LORA)
+        # Injection must leave the full-mode model alone; parity is only meaningful
+        # against an independently wrapped, genuinely unadapted backbone.
+        assert not any(isinstance(module, LowRankResidualLinear) for module in plain.transformer.modules())
+        data = denoiser_inputs()
+        expected = plain(**dict(data)).detach()
+        # The injected residual is exactly zero, so the outputs differ only by the
+        # float32 GEMM rounding that freezing the wrapped weights introduces (~1e-7
+        # here). The tolerance is tight enough that any trained adapter fails it.
+>       torch.testing.assert_close(adapted(**dict(data)), expected, rtol=1e-5, atol=1e-6)
+E       AssertionError: Tensor-likes are not close!
+E       
+E       Mismatched elements: 1536 / 1536 (100.0%)
+E       Greatest absolute difference: 0.09047553688287735 at index (0, 2, 33) (up to 1e-06 allowed)
+E       Greatest relative difference: 31.680490493774414 at index (1, 1, 117) (up to 1e-05 allowed)
+
+tests/test_dit_lora.py:141: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_dit_lora.py::test_adapter_injection_is_zero_initialized_and_leaves_the_rest_trainable
+1 failed in 0.60s

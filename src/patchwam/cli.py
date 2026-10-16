@@ -73,6 +73,14 @@ def main():
             path = Path(settings.output_dir, "configuration.yaml")
             if not path.exists():
                 path.write_text(OmegaConf.to_yaml(config))
+            report = getattr(model, "parameter_report", None)
+            if callable(report):
+                parameters = report()
+                report_path = Path(settings.output_dir, "parameter_report.json")
+                if not report_path.exists():
+                    report_path.write_text(json.dumps(parameters, indent=2) + "\n")
+                print(json.dumps({"parameter_report": parameters["counts"], "mode": parameters["mode"]}),
+                      flush=True)
 
         run._on_main("record configuration", record_configuration)
     else:

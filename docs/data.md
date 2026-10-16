@@ -115,10 +115,10 @@ block and applies temporally consistent appearance augmentation with probability
 
 ## Task selection
 
-`data.task_selection` narrows a run to exact task names. Leave it unset to keep
-the full dataset. Task *names*, not local indices, are the identity, so the
-selector is safe for a merged root whose `meta/tasks.jsonl` numbering differs
-from another root:
+`data.task_selection` narrows a run to a task subset. Leave it unset to keep the
+full dataset. The exact-name form uses task *names*, not local indices, as the
+identity, so it is safe for a merged root whose `meta/tasks.jsonl` numbering
+differs from another root:
 
 ```yaml
 data:
@@ -138,16 +138,54 @@ row filter. Each episode resolves its task from `meta/episodes.jsonl` (`tasks`,
 `task_index` column when the metadata carries none. A requested name that
 appears in no root, an episode without a resolvable identity, and an episode
 mixing several task identities all raise instead of silently training on the
-full data. `configs/robotwin_vlm_5tasks.yaml` uses this for the five-task
-ablation: it copies `configs/robotwin_vlm.yaml` unchanged apart from the
-selector and `training.output_dir`, so model, conditioning, augmentation,
-non-idle filtering, horizon, dimensions, optimizer, epochs, and batch settings
-are preserved.
+full data.
 
-The subset still needs statistics that describe the same five tasks. Point
-`PATCHWAM_NORM_STATS` at matching statistics, or fit them from the selected
-split with `data.pretrained_norm_stats=null`; the normalization method itself is
-unchanged.
+Some releases store instruction paraphrases instead of benchmark names, so one
+episode can declare dozens of instruction variants and no single task name
+identifies a benchmark task. For those roots,
+`data.task_selection.episode_ranges` defines benchmark identity by root-local
+half-open episode ranges and never reads the instruction text (values below are
+an illustration, not a specific release):
+
+```yaml
+data:
+  task_selection:
+    tasks: [place_the_red_block, stack_two_bowls]
+    expected_episodes: 1000
+    episode_ranges:
+      place_the_red_block: [[0, 500]]
+      stack_two_bowls: [[500, 1000]]
+```
+
+`episode_ranges` must name exactly the requested `tasks`, use integer half-open
+intervals with `0 <= start < end`, and cover no overlapping ranges; a missing or
+extra name, an out-of-bounds interval, an interval covering undeclared episodes,
+and a task whose episodes the `episode_index_filter` removes all raise. The map
+applies to root-local indices, so it takes exactly one dataset root, and
+`expected_episodes` fails the run when the root is a different release.
+
+`configs/robotwin_vlm_5tasks.yaml` targets the RoboTwin-Clean release instead,
+where every task is its own LeRobot v2.1 root: it lists the five requested roots
+explicitly and uses no `data.task_selection`, so listing the roots *is* the
+filter. `PATCHWAM_DATA_ROOT` then names the parent directory (default
+`/data/RoboTwin/RoboTwin-Clean`) and each entry is
+`${oc.env:PATCHWAM_DATA_ROOT,/data/RoboTwin/RoboTwin-Clean}/<task>`. The five
+roots stay listed even when the release has not published one yet, so a missing
+folder fails instead of silently training on a smaller subset.
+
+That release ships no non-idle row filter and no prepared statistics file, so
+the config defaults `data.nonidle_filter_path` to `None` (rows unfiltered) and
+`data.pretrained_norm_stats` to `None`, which fits z-score statistics from the
+selected roots; `PATCHWAM_NORM_STATS` and `PATCHWAM_NONIDLE_FILTER` still
+override either path, and the normalization method is unchanged. Its task roots
+report 15 fps, so with the unchanged 16-step action horizon a window spans about
+1.07 s of recording rather than 0.32 s at 50 fps; the reader takes FPS from
+metadata and applies no resampling. Model, conditioning, augmentation, horizon,
+dimensions, optimizer, five epochs, LR and batch settings are unchanged from
+`configs/robotwin_vlm.yaml`.
+
+`expected_episodes` is only valid together with `episode_ranges`; supplying it
+alone raises instead of being ignored.
 
 ## Optional text caches
 

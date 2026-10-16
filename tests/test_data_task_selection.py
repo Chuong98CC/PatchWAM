@@ -195,6 +195,8 @@ def test_metadata_indices_resolve_through_the_root_table(tmp_path):
     ({"tasks": ["turn_switch", "turn_switch"]}, ValueError, "Duplicate task"),
     ({"tasks": FIVE_TASKS, "num_tasks": 2}, ValueError, "Unknown task selection options"),
     ({}, ValueError, "requires an explicit 'tasks' list"),
+    ({"tasks": ["turn_switch"], "expected_episodes": 2}, ValueError,
+     "only applies to an episode_ranges selection"),
     (["turn_switch"], TypeError, "must be a mapping"),
     ({"tasks": "turn_switch"}, TypeError, "must be a list of exact task names"),
     ({"tasks": [1]}, TypeError, "non-empty strings"),
@@ -300,3 +302,69 @@ def test_root_split_does_not_decide_candidate_presence(tmp_path):
     assert train.episodes and validation.episodes
     assert train_roots | val_roots == {str(first.resolve()), str(second.resolve())}
     assert not train_roots & val_roots
+
+
+def test_episode_ranges_select_release_style_paraphrase_episodes(tmp_path):
+    """Benchmark identity by episode range, not by the paraphrase text."""
+    episodes = [(0, 0, "push the switch"), (1, 1, "rotate the qr code")]
+    paraphrases = {0: [f"instruction variant {index}" for index in range(5)],
+                   1: [f"other variant {index}" for index in range(3)]}
+    root = make_root(tmp_path, "release", episodes, episode_tasks=paraphrases)
+    selection = {"tasks": ["turn_switch"], "expected_episodes": 2,
+                 "episode_ranges": {"turn_switch": [[0, 1]]}}
+    dataset = open_dataset([root], write_stats(tmp_path), task_selection=selection)
+    assert [episode.index for episode in dataset.episodes] == [0]
+    assert dataset.task_selection["episode_ranges"] == {"turn_switch": [[0, 1]]}
+    assert "push the switch" in dataset[0]["instruction"]
+
+
+def test_episode_ranges_compose_with_the_split_and_nonidle_filter(tmp_path):
+    episodes = [(0, 0, "first"), (1, 0, "first"), (2, 1, "second"), (3, 1, "second")]
+    paraphrases = {index: [f"variant {index}.{variant}" for variant in range(4)]
+                   for index in range(4)}
+    root = make_root(tmp_path, "release", episodes, episode_tasks=paraphrases)
+    nonidle = tmp_path / "nonidle.json"
+    nonidle.write_text(json.dumps({"episodes": {str(index): [[0, 2], [6, 10]]
+                                                for index in range(4)}}))
+    selection = {"tasks": ["first", "second"], "expected_episodes": 4,
+                 "episode_ranges": {"first": [[0, 2]], "second": [[2, 4]]}}
+    dataset = open_dataset([root], None, task_selection=selection, num_frames=5,
+                           nonidle_filter_path=nonidle, is_training_set=True)
+    assert dataset.statistics["num_episodes"] == 4
+    assert dataset.statistics["num_transition"] == 4 * 6
+    train = open_dataset([root], write_stats(tmp_path), task_selection=selection,
+                         val_set_proportion=0.5)
+    assert len(train.episodes) == 2
+
+
+@pytest.mark.parametrize("selection,message", [
+    ({"tasks": ["turn_switch"], "episode_ranges": {"turn_switch": [[0, 9]], "extra": [[0, 1]]}},
+     "must name exactly the requested tasks"),
+    ({"tasks": ["first", "second"], "episode_ranges": {"first": [[0, 1]]}},
+     "must name exactly the requested tasks"),
+    ({"tasks": ["turn_switch"], "episode_ranges": {"turn_switch": []}},
+     "nonempty list"),
+    ({"tasks": ["turn_switch"], "episode_ranges": {"turn_switch": [[1, 1]]}},
+     "0 <= start < end"),
+    ({"tasks": ["turn_switch"], "episode_ranges": {"turn_switch": [[0, 1], [0, 2]]}},
+     "overlaps another mapped range"),
+    ({"tasks": ["turn_switch"], "episode_ranges": {"turn_switch": ["x"]}},
+     "two integers"),
+    ({"tasks": ["turn_switch"], "expected_episodes": 3, "episode_ranges": {"turn_switch": [[0, 1]]}},
+     "declares 2 episodes but the selection expects 3"),
+    ({"tasks": ["turn_switch"], "episode_ranges": {"turn_switch": [[0, 5]]}},
+     "exceeds the 2 episodes declared"),
+])
+def test_invalid_episode_ranges_fail_loudly(tmp_path, selection, message):
+    root = make_root(tmp_path, "release", [(0, 0, "first"), (1, 0, "first")])
+    with pytest.raises(ValueError, match=message):
+        open_dataset([root], write_stats(tmp_path), task_selection=selection)
+
+
+def test_episode_ranges_require_a_single_root(tmp_path):
+    first = make_root(tmp_path, "root_a", [(0, 0, "first")])
+    second = make_root(tmp_path, "root_b", [(0, 0, "second")])
+    selection = {"tasks": ["first", "second"],
+                 "episode_ranges": {"first": [[0, 1]], "second": [[1, 2]]}}
+    with pytest.raises(ValueError, match="exactly one dataset root"):
+        open_dataset([first, second], write_stats(tmp_path), task_selection=selection)

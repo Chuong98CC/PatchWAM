@@ -1,22 +1,32 @@
-# Five-task RobotWin ablation of robotwin_vlm.yaml.
+# Five-task RoboTwin-Clean ablation of robotwin_vlm.yaml.
 #
 # This is a full standalone copy of configs/robotwin_vlm.yaml, because the
 # loader merges a dotlist over one file and does not resolve YAML defaults.
-# Model, conditioning, augmentation, non-idle filtering, horizon, dimensions,
-# optimizer, five epochs, LR and batch settings are unchanged; only the task
-# subset and the output directory differ. The selector matches exact task
-# names, so it is safe for merged roots whose local task indices differ.
+# Model, conditioning, augmentation, horizon, dimensions, optimizer, five
+# epochs, LR and batch settings are unchanged; only the task roots, the
+# normalization-statistics default, the (absent) non-idle row filter, the asset
+# paths and the output directory differ.
 #
-# The subset needs normalization statistics that describe the same five tasks.
-# Point PATCHWAM_NORM_STATS at matching statistics, or fit them from the
-# selected split with `data.pretrained_norm_stats=null`; the base recipe's
-# normalization method itself is unchanged.
+# Each task ships as its own LeRobot v2.1 root under the parent directory, so
+# `data.dataset_dirs` *is* the task filter and no `data.task_selection` is used.
+# The five requested roots stay listed even when the release has not published
+# one yet: a missing folder fails the run instead of silently training on a
+# smaller subset.
+#
+# PATCHWAM_NORM_STATS defaults to None, which fits z-score statistics from the
+# selected roots; the normalization method itself is unchanged.
 model:
   _target_: patchwam.models.FluxAssetPolicy.from_local_assets
-  transformer_path: ${oc.env:PATCHWAM_TRANSFORMER}
-  autoencoder_path: ${oc.env:PATCHWAM_AUTOENCODER}
-  text_encoder_path: ${oc.env:PATCHWAM_VLM}
-  flux_source: ${oc.env:FLUX2_SRC}
+  # Defaults point at the local Fast-WAM/ImageWAM asset checkout and stay
+  # overridable through the same environment variables as configs/robotwin_vlm.yaml.
+  # The loader consumes the original black-forest-labs single-file/flux2-format
+  # weights, so the transformer uses the combined release file and the
+  # autoencoder the flux2 `ae.safetensors`, not the diffusers-format copies
+  # under `transformer/` and `vae/`.
+  transformer_path: ${oc.env:PATCHWAM_TRANSFORMER,/home/chuong/workspace/wam/ImageWAM/checkpoints/flux2/FLUX.2-klein-base-4B/flux-2-klein-base-4b.safetensors}
+  autoencoder_path: ${oc.env:PATCHWAM_AUTOENCODER,/home/chuong/workspace/wam/ImageWAM/checkpoints/flux2/FLUX.2-dev/ae.safetensors}
+  text_encoder_path: ${oc.env:PATCHWAM_VLM,/data/Pretrained_models/Qwen3-VL-4B-Instruct}
+  flux_source: ${oc.env:FLUX2_SRC,/home/chuong/workspace/wam/ImageWAM/third_party/flux2}
   action_dim: ${data.processor.action_output_dim}
   proprio_dim: ${data.processor.proprio_output_dim}
   variant: klein-base-4b
@@ -32,15 +42,16 @@ model:
   vl_trainable_adapters: false
 data:
   _target_: patchwam.data.EpisodeDataset
+  # PATCHWAM_DATA_ROOT names the parent directory holding one LeRobot root per
+  # task. Listing the five requested roots is the task filter; a folder the
+  # release has not published yet still fails the run instead of silently
+  # training on a smaller subset.
   dataset_dirs:
-  - ${oc.env:PATCHWAM_DATA_ROOT}
-  task_selection:
-    tasks:
-    - turn_switch
-    - rotate_qrcode
-    - blocks_ranking_size
-    - move_stapler_pad
-    - hanging_mug
+  - ${oc.env:PATCHWAM_DATA_ROOT,/data/RoboTwin/RoboTwin-Clean}/turn_switch
+  - ${oc.env:PATCHWAM_DATA_ROOT,/data/RoboTwin/RoboTwin-Clean}/rotate_qrcode
+  - ${oc.env:PATCHWAM_DATA_ROOT,/data/RoboTwin/RoboTwin-Clean}/blocks_ranking_size
+  - ${oc.env:PATCHWAM_DATA_ROOT,/data/RoboTwin/RoboTwin-Clean}/move_stapler_pad
+  - ${oc.env:PATCHWAM_DATA_ROOT,/data/RoboTwin/RoboTwin-Clean}/hanging_mug
   num_frames: 17
   endpoint_frames_only: true
   action_video_freq_ratio: 1
@@ -53,8 +64,12 @@ data:
   robotwin_camera_layout: compact_288x256
   val_set_proportion: 0.01
   is_training_set: true
-  pretrained_norm_stats: ${oc.env:PATCHWAM_NORM_STATS}
-  nonidle_filter_path: ${oc.env:PATCHWAM_NONIDLE_FILTER}
+  # Optional: default None fits z-score statistics from the selected training
+  # roots. Set PATCHWAM_NORM_STATS to reuse a prepared statistics file.
+  pretrained_norm_stats: ${oc.env:PATCHWAM_NORM_STATS,null}
+  # This release ships no non-idle row filter, so rows stay unfiltered by
+  # default. An explicit PATCHWAM_NONIDLE_FILTER still applies it.
+  nonidle_filter_path: ${oc.env:PATCHWAM_NONIDLE_FILTER,null}
   shape_meta:
     images:
     - key: cam_high

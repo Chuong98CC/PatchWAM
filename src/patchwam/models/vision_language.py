@@ -11,24 +11,7 @@ from PIL import Image
 from torch import nn
 from torch.nn import functional as F
 
-
-class LowRankResidualLinear(nn.Module):
-    """Frozen linear map with a trainable low-rank residual."""
-
-    def __init__(self, base: nn.Linear, rank: int = 64, alpha: float = 128, dropout: float = 0.05):
-        super().__init__()
-        if rank < 1 or not math.isfinite(alpha) or alpha <= 0 or not 0 <= dropout < 1:
-            raise ValueError("Invalid low-rank adapter settings")
-        self.base = base.requires_grad_(False)
-        self.residual_in = nn.Linear(base.in_features, rank, bias=False).to(base.weight)
-        self.residual_out = nn.Linear(rank, base.out_features, bias=False).to(base.weight)
-        nn.init.kaiming_uniform_(self.residual_in.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.residual_out.weight)
-        self.dropout = nn.Dropout(dropout)
-        self.multiplier = alpha / rank
-
-    def forward(self, value):
-        return self.base(value) + self.residual_out(self.residual_in(self.dropout(value))) * self.multiplier
+from .lora import LowRankResidualLinear
 
 
 def pool_visual_grid(tokens: torch.Tensor, height: int, width: int, size: int = 4):

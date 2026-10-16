@@ -1,0 +1,1081 @@
+.................................................................F...... [ 64%]
+......F...FFF.............F.............                                 [100%]
+=================================== FAILURES ===================================
+_________ test_self_flow_teacher_and_label_warmup_continue_with_engine _________
+
+tmp_path = PosixPath('/tmp/pytest-of-chuong/pytest-1031/test_self_flow_teacher_and_lab0')
+
+    def test_self_flow_teacher_and_label_warmup_continue_with_engine(tmp_path):
+        def run(directory):
+            return OptimizationRun(
+                policy(self_flow_variant=3, self_flow_label_warmup=1,
+                       self_flow_pseudo_label_fraction=1, self_flow_sampling_steps=1),
+                TensorExamples(length=8, horizon=2),
+                RunSettings(output_dir=str(directory), epochs=1, max_updates=3, batch_size=2,
+                            accumulation=1, cpu=True, precision="no", workers=0, ema_decay=0.9,
+                            checkpoint_every=1, log_every=1),
+            )
+    
+        full = run(tmp_path / "full")
+        full.train()
+        resumed = run(tmp_path / "resumed")
+>       resumed.restore(tmp_path / "full" / "step_0000001")
+
+tests/test_conditioning_flow.py:268: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/patchwam/engine.py:293: in restore
+    self.accelerator.load_state(str(directory))
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <accelerate.accelerator.Accelerator object at 0x74cb1a149ba0>
+input_dir = '/tmp/pytest-of-chuong/pytest-1031/test_self_flow_teacher_and_lab0/full/step_0000001'
+load_model_func_kwargs = {}
+
+    def load_state(self, input_dir: str = None, **load_model_func_kwargs):
+        """
+        Loads the current states of the model, optimizer, scaler, RNG generators, and registered objects.
+    
+        <Tip>
+    
+        Should only be used in conjunction with [`Accelerator.save_state`]. If a file is not registered for
+        checkpointing, it will not be loaded if stored in the directory.
+    
+        </Tip>
+    
+        Args:
+            input_dir (`str` or `os.PathLike`):
+                The name of the folder all relevant weights and states were saved in. Can be `None` if
+                `automatic_checkpoint_naming` is used, and will pick up from the latest checkpoint.
+            load_model_func_kwargs (`dict`, *optional*):
+                Additional keyword arguments for loading model which can be passed to the underlying load function,
+                such as optional arguments for DeepSpeed's `load_checkpoint` function or a `map_location` to load the
+                model and optimizer on.
+    
+        Example:
+    
+        ```python
+        >>> from accelerate import Accelerator
+    
+        >>> accelerator = Accelerator()
+        >>> model, optimizer, lr_scheduler = ...
+        >>> model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
+        >>> accelerator.load_state("my_checkpoint")
+        ```
+        """
+        if input_dir is not None:
+            # Check if folder exists
+            input_dir = os.path.expanduser(input_dir)
+            if not os.path.isdir(input_dir):
+                raise ValueError(f"Tried to find {input_dir} but folder does not exist")
+        elif self.project_configuration.automatic_checkpoint_naming:
+            # Pick up from automatic checkpoint naming
+            input_dir = os.path.join(self.project_dir, "checkpoints")
+            folders = [os.path.join(input_dir, folder) for folder in os.listdir(input_dir)]
+    
+            def _inner(folder):
+                return list(map(int, re.findall(r"[\/]?([0-9]+)(?=[^\/]*$)", folder)))[0]
+    
+            folders.sort(key=_inner)
+            input_dir = folders[-1]
+        else:
+            raise ValueError("No input_dir provided and automatic checkpoint naming is disabled.")
+        logger.info(f"Loading states from {input_dir}")
+    
+        # Load the models taking care of FSDP and DeepSpeed nuances
+        models = []
+        for i, model in enumerate(self._models):
+            if self.distributed_type == DistributedType.FSDP:
+                logger.info("Loading FSDP model")
+                load_fsdp_model(self.state.fsdp_plugin, self, model, input_dir, i)
+                logger.info(f"FSDP Model loaded from input dir {input_dir}")
+            elif self.distributed_type == DistributedType.DEEPSPEED:
+                logger.info("Loading DeepSpeed Model and Optimizer")
+                ckpt_id = f"{MODEL_NAME}" if i == 0 else f"{MODEL_NAME}_{i}"
+                model.load_checkpoint(input_dir, ckpt_id, **load_model_func_kwargs)
+                logger.info(f"DeepSpeed Model and Optimizer loaded from input dir {os.path.join(input_dir, ckpt_id)}")
+            elif self.distributed_type == DistributedType.MEGATRON_LM:
+                logger.info("Loading Megatron-LM Model, Optimizer and Scheduler")
+                model.load_checkpoint(input_dir)
+                logger.info(f"Megatron-LM Model , Optimizer and Scheduler loaded from input dir {input_dir}")
+            else:
+                models.append(model)
+    
+        # Load the optimizers taking care of FSDP and DeepSpeed nuances
+        optimizers = []
+        if self.distributed_type == DistributedType.FSDP:
+            for i, opt in enumerate(self._optimizers):
+                logger.info("Loading FSDP Optimizer")
+                load_fsdp_optimizer(self.state.fsdp_plugin, self, opt, self._models[i], input_dir, i)
+                logger.info(f"FSDP Optimizer loaded from input dir {input_dir}")
+        elif self.distributed_type not in [DistributedType.DEEPSPEED, DistributedType.MEGATRON_LM]:
+            optimizers = self._optimizers
+    
+        # Load the lr schedulers taking care of DeepSpeed nuances
+        schedulers = []
+        if self.distributed_type == DistributedType.DEEPSPEED:
+            for i, scheduler in enumerate(self._schedulers):
+                if isinstance(scheduler, DeepSpeedSchedulerWrapper):
+                    continue
+                schedulers.append(scheduler)
+        elif self.distributed_type not in [DistributedType.MEGATRON_LM]:
+            schedulers = self._schedulers
+    
+        dataloaders = self._dataloaders
+    
+        # Call model loading hooks that might have been registered with
+        # accelerator.register_model_state_hook
+        for hook in self._load_model_state_pre_hook.values():
+            hook(models, input_dir)
+    
+        map_location = load_model_func_kwargs.pop("map_location", None)
+        if map_location is None:
+            if self.num_processes > 1 and self.distributed_type in (
+                DistributedType.MULTI_GPU,
+                DistributedType.MULTI_MLU,
+                DistributedType.MULTI_MUSA,
+                DistributedType.MULTI_NPU,
+            ):
+                map_location = "on_device"
+            else:
+                map_location = "cpu"
+    
+        override_attributes = load_accelerator_state(
+            input_dir,
+            models,
+            optimizers,
+            schedulers,
+            dataloaders,
+            self.state.process_index,
+            self.scaler,
+            map_location,
+            **load_model_func_kwargs,
+        )
+>       self.step = override_attributes["step"]
+E       KeyError: 'step'
+
+../../miniconda3/envs/fluxvla/lib/python3.10/site-packages/accelerate/accelerator.py:3156: KeyError
+----------------------------- Captured stdout call -----------------------------
+{"update": 1, "loss": 1.5582822561264038, "loss_video": 1.4860495328903198, "loss_action": 0.0, "sigma_mean": 0.8739000558853149, "loss_representation": 1.0190718173980713, "pseudo_label_fraction": 1.0, "pseudo_mse": 0.0, "learning_rate": 7.525e-05}
+{"update": 2, "loss": 2.8361525535583496, "loss_video": 2.6379106044769287, "loss_action": 0.7724199295043945, "sigma_mean": 0.7808707356452942, "loss_representation": 0.9309714436531067, "pseudo_label_fraction": 1.0, "pseudo_mse": 1.152557611465454, "learning_rate": 2.5750000000000013e-05}
+{"update": 3, "loss": 3.1172008514404297, "loss_video": 3.2141103744506836, "loss_action": 0.7219650149345398, "sigma_mean": 0.6668776273727417, "loss_representation": 0.9852256178855896, "pseudo_label_fraction": 1.0, "pseudo_mse": 0.7736321687698364, "learning_rate": 1.0000000000000002e-06}
+___ test_checkpoint_continuation_restores_average_and_native_export_exactly ____
+
+tmp_path = PosixPath('/tmp/pytest-of-chuong/pytest-1031/test_checkpoint_continuation_r0')
+
+    def test_checkpoint_continuation_restores_average_and_native_export_exactly(tmp_path):
+        baseline = make_run(tmp_path / "baseline")
+        baseline.train()
+        interrupted = make_run(tmp_path / "interrupted")
+        checkpoint = interrupted.checkpoint
+    
+        class Interrupted(Exception):
+            pass
+    
+        def stop_after_save(epoch, next_batch, **kwargs):
+            checkpoint(epoch, next_batch, **kwargs)
+            raise Interrupted
+    
+        interrupted.checkpoint = stop_after_save
+        with pytest.raises(Interrupted):
+            interrupted.train()
+        assert interrupted.ema.updates == 2
+        resumed = make_run(tmp_path / "resumed")
+>       resumed.restore(tmp_path / "interrupted" / "step_0000002")
+
+tests/test_averaging.py:245: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/patchwam/engine.py:293: in restore
+    self.accelerator.load_state(str(directory))
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <accelerate.accelerator.Accelerator object at 0x74cb1a539540>
+input_dir = '/tmp/pytest-of-chuong/pytest-1031/test_checkpoint_continuation_r0/interrupted/step_0000002'
+load_model_func_kwargs = {}
+
+    def load_state(self, input_dir: str = None, **load_model_func_kwargs):
+        """
+        Loads the current states of the model, optimizer, scaler, RNG generators, and registered objects.
+    
+        <Tip>
+    
+        Should only be used in conjunction with [`Accelerator.save_state`]. If a file is not registered for
+        checkpointing, it will not be loaded if stored in the directory.
+    
+        </Tip>
+    
+        Args:
+            input_dir (`str` or `os.PathLike`):
+                The name of the folder all relevant weights and states were saved in. Can be `None` if
+                `automatic_checkpoint_naming` is used, and will pick up from the latest checkpoint.
+            load_model_func_kwargs (`dict`, *optional*):
+                Additional keyword arguments for loading model which can be passed to the underlying load function,
+                such as optional arguments for DeepSpeed's `load_checkpoint` function or a `map_location` to load the
+                model and optimizer on.
+    
+        Example:
+    
+        ```python
+        >>> from accelerate import Accelerator
+    
+        >>> accelerator = Accelerator()
+        >>> model, optimizer, lr_scheduler = ...
+        >>> model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
+        >>> accelerator.load_state("my_checkpoint")
+        ```
+        """
+        if input_dir is not None:
+            # Check if folder exists
+            input_dir = os.path.expanduser(input_dir)
+            if not os.path.isdir(input_dir):
+                raise ValueError(f"Tried to find {input_dir} but folder does not exist")
+        elif self.project_configuration.automatic_checkpoint_naming:
+            # Pick up from automatic checkpoint naming
+            input_dir = os.path.join(self.project_dir, "checkpoints")
+            folders = [os.path.join(input_dir, folder) for folder in os.listdir(input_dir)]
+    
+            def _inner(folder):
+                return list(map(int, re.findall(r"[\/]?([0-9]+)(?=[^\/]*$)", folder)))[0]
+    
+            folders.sort(key=_inner)
+            input_dir = folders[-1]
+        else:
+            raise ValueError("No input_dir provided and automatic checkpoint naming is disabled.")
+        logger.info(f"Loading states from {input_dir}")
+    
+        # Load the models taking care of FSDP and DeepSpeed nuances
+        models = []
+        for i, model in enumerate(self._models):
+            if self.distributed_type == DistributedType.FSDP:
+                logger.info("Loading FSDP model")
+                load_fsdp_model(self.state.fsdp_plugin, self, model, input_dir, i)
+                logger.info(f"FSDP Model loaded from input dir {input_dir}")
+            elif self.distributed_type == DistributedType.DEEPSPEED:
+                logger.info("Loading DeepSpeed Model and Optimizer")
+                ckpt_id = f"{MODEL_NAME}" if i == 0 else f"{MODEL_NAME}_{i}"
+                model.load_checkpoint(input_dir, ckpt_id, **load_model_func_kwargs)
+                logger.info(f"DeepSpeed Model and Optimizer loaded from input dir {os.path.join(input_dir, ckpt_id)}")
+            elif self.distributed_type == DistributedType.MEGATRON_LM:
+                logger.info("Loading Megatron-LM Model, Optimizer and Scheduler")
+                model.load_checkpoint(input_dir)
+                logger.info(f"Megatron-LM Model , Optimizer and Scheduler loaded from input dir {input_dir}")
+            else:
+                models.append(model)
+    
+        # Load the optimizers taking care of FSDP and DeepSpeed nuances
+        optimizers = []
+        if self.distributed_type == DistributedType.FSDP:
+            for i, opt in enumerate(self._optimizers):
+                logger.info("Loading FSDP Optimizer")
+                load_fsdp_optimizer(self.state.fsdp_plugin, self, opt, self._models[i], input_dir, i)
+                logger.info(f"FSDP Optimizer loaded from input dir {input_dir}")
+        elif self.distributed_type not in [DistributedType.DEEPSPEED, DistributedType.MEGATRON_LM]:
+            optimizers = self._optimizers
+    
+        # Load the lr schedulers taking care of DeepSpeed nuances
+        schedulers = []
+        if self.distributed_type == DistributedType.DEEPSPEED:
+            for i, scheduler in enumerate(self._schedulers):
+                if isinstance(scheduler, DeepSpeedSchedulerWrapper):
+                    continue
+                schedulers.append(scheduler)
+        elif self.distributed_type not in [DistributedType.MEGATRON_LM]:
+            schedulers = self._schedulers
+    
+        dataloaders = self._dataloaders
+    
+        # Call model loading hooks that might have been registered with
+        # accelerator.register_model_state_hook
+        for hook in self._load_model_state_pre_hook.values():
+            hook(models, input_dir)
+    
+        map_location = load_model_func_kwargs.pop("map_location", None)
+        if map_location is None:
+            if self.num_processes > 1 and self.distributed_type in (
+                DistributedType.MULTI_GPU,
+                DistributedType.MULTI_MLU,
+                DistributedType.MULTI_MUSA,
+                DistributedType.MULTI_NPU,
+            ):
+                map_location = "on_device"
+            else:
+                map_location = "cpu"
+    
+        override_attributes = load_accelerator_state(
+            input_dir,
+            models,
+            optimizers,
+            schedulers,
+            dataloaders,
+            self.state.process_index,
+            self.scaler,
+            map_location,
+            **load_model_func_kwargs,
+        )
+>       self.step = override_attributes["step"]
+E       KeyError: 'step'
+
+../../miniconda3/envs/fluxvla/lib/python3.10/site-packages/accelerate/accelerator.py:3156: KeyError
+----------------------------- Captured stdout call -----------------------------
+{"update": 1, "loss": 1.2771981954574585, "learning_rate": 8.55017856687341e-05}
+{"update": 2, "loss": 1.3057622909545898, "learning_rate": 5.05e-05}
+{"update": 3, "loss": 1.3429322242736816, "learning_rate": 1.5498214331265904e-05}
+{"update": 4, "loss": 1.382176160812378, "learning_rate": 1.0000000000000002e-06}
+{"update": 1, "loss": 1.2771981954574585, "learning_rate": 8.55017856687341e-05}
+{"update": 2, "loss": 1.3057622909545898, "learning_rate": 5.05e-05}
+_ test_combined_visual_history_and_self_flow_teacher_resume_without_reencoding[1] _
+
+tmp_path = PosixPath('/tmp/pytest-of-chuong/pytest-1031/test_combined_visual_history_a0')
+variant = 1
+
+    @pytest.mark.parametrize("variant", [1, 2, 3])
+    def test_combined_visual_history_and_self_flow_teacher_resume_without_reencoding(tmp_path, variant):
+        def create(directory, **policy_changes):
+            torch.manual_seed(71)
+            model = FluxAssetPolicy(
+                make_tiny_policy(
+                    text_dim=16,
+                    width=32,
+                    depth=2,
+                    self_flow_variant=variant,
+                    self_flow_label_warmup=1,
+                    self_flow_pseudo_label_fraction=1,
+                    self_flow_sampling_steps=2,
+                    condition_dropout=0.2,
+                    **policy_changes,
+                ),
+                SmallImageAsset(),
+                TrainableVisualConditioning(),
+                history_pool_size=2,
+            )
+            return OptimizationRun(
+                model,
+                VisualHistoryExamples(length=8, text_dim=16),
+                run_settings(directory, epochs=1, accumulation=1),
+            )
+    
+        baseline = create(tmp_path / "baseline")
+        baseline.train()
+        assert baseline.model.text_encoder.calls == 4
+        assert baseline.model.policy._optimizer_updates == baseline.ema.updates == 4
+        interrupted = create(tmp_path / "interrupted")
+        checkpoint = interrupted.checkpoint
+    
+        class Interrupted(Exception):
+            pass
+    
+        def stop_after_save(epoch, next_batch, **kwargs):
+            checkpoint(epoch, next_batch, **kwargs)
+            raise Interrupted
+    
+        interrupted.checkpoint = stop_after_save
+        with pytest.raises(Interrupted):
+            interrupted.train()
+        resumed = create(tmp_path / "resumed")
+>       resumed.restore(tmp_path / "interrupted" / "step_0000002")
+
+tests/test_averaging.py:385: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/patchwam/engine.py:293: in restore
+    self.accelerator.load_state(str(directory))
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <accelerate.accelerator.Accelerator object at 0x74cb19b54b80>
+input_dir = '/tmp/pytest-of-chuong/pytest-1031/test_combined_visual_history_a0/interrupted/step_0000002'
+load_model_func_kwargs = {}
+
+    def load_state(self, input_dir: str = None, **load_model_func_kwargs):
+        """
+        Loads the current states of the model, optimizer, scaler, RNG generators, and registered objects.
+    
+        <Tip>
+    
+        Should only be used in conjunction with [`Accelerator.save_state`]. If a file is not registered for
+        checkpointing, it will not be loaded if stored in the directory.
+    
+        </Tip>
+    
+        Args:
+            input_dir (`str` or `os.PathLike`):
+                The name of the folder all relevant weights and states were saved in. Can be `None` if
+                `automatic_checkpoint_naming` is used, and will pick up from the latest checkpoint.
+            load_model_func_kwargs (`dict`, *optional*):
+                Additional keyword arguments for loading model which can be passed to the underlying load function,
+                such as optional arguments for DeepSpeed's `load_checkpoint` function or a `map_location` to load the
+                model and optimizer on.
+    
+        Example:
+    
+        ```python
+        >>> from accelerate import Accelerator
+    
+        >>> accelerator = Accelerator()
+        >>> model, optimizer, lr_scheduler = ...
+        >>> model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
+        >>> accelerator.load_state("my_checkpoint")
+        ```
+        """
+        if input_dir is not None:
+            # Check if folder exists
+            input_dir = os.path.expanduser(input_dir)
+            if not os.path.isdir(input_dir):
+                raise ValueError(f"Tried to find {input_dir} but folder does not exist")
+        elif self.project_configuration.automatic_checkpoint_naming:
+            # Pick up from automatic checkpoint naming
+            input_dir = os.path.join(self.project_dir, "checkpoints")
+            folders = [os.path.join(input_dir, folder) for folder in os.listdir(input_dir)]
+    
+            def _inner(folder):
+                return list(map(int, re.findall(r"[\/]?([0-9]+)(?=[^\/]*$)", folder)))[0]
+    
+            folders.sort(key=_inner)
+            input_dir = folders[-1]
+        else:
+            raise ValueError("No input_dir provided and automatic checkpoint naming is disabled.")
+        logger.info(f"Loading states from {input_dir}")
+    
+        # Load the models taking care of FSDP and DeepSpeed nuances
+        models = []
+        for i, model in enumerate(self._models):
+            if self.distributed_type == DistributedType.FSDP:
+                logger.info("Loading FSDP model")
+                load_fsdp_model(self.state.fsdp_plugin, self, model, input_dir, i)
+                logger.info(f"FSDP Model loaded from input dir {input_dir}")
+            elif self.distributed_type == DistributedType.DEEPSPEED:
+                logger.info("Loading DeepSpeed Model and Optimizer")
+                ckpt_id = f"{MODEL_NAME}" if i == 0 else f"{MODEL_NAME}_{i}"
+                model.load_checkpoint(input_dir, ckpt_id, **load_model_func_kwargs)
+                logger.info(f"DeepSpeed Model and Optimizer loaded from input dir {os.path.join(input_dir, ckpt_id)}")
+            elif self.distributed_type == DistributedType.MEGATRON_LM:
+                logger.info("Loading Megatron-LM Model, Optimizer and Scheduler")
+                model.load_checkpoint(input_dir)
+                logger.info(f"Megatron-LM Model , Optimizer and Scheduler loaded from input dir {input_dir}")
+            else:
+                models.append(model)
+    
+        # Load the optimizers taking care of FSDP and DeepSpeed nuances
+        optimizers = []
+        if self.distributed_type == DistributedType.FSDP:
+            for i, opt in enumerate(self._optimizers):
+                logger.info("Loading FSDP Optimizer")
+                load_fsdp_optimizer(self.state.fsdp_plugin, self, opt, self._models[i], input_dir, i)
+                logger.info(f"FSDP Optimizer loaded from input dir {input_dir}")
+        elif self.distributed_type not in [DistributedType.DEEPSPEED, DistributedType.MEGATRON_LM]:
+            optimizers = self._optimizers
+    
+        # Load the lr schedulers taking care of DeepSpeed nuances
+        schedulers = []
+        if self.distributed_type == DistributedType.DEEPSPEED:
+            for i, scheduler in enumerate(self._schedulers):
+                if isinstance(scheduler, DeepSpeedSchedulerWrapper):
+                    continue
+                schedulers.append(scheduler)
+        elif self.distributed_type not in [DistributedType.MEGATRON_LM]:
+            schedulers = self._schedulers
+    
+        dataloaders = self._dataloaders
+    
+        # Call model loading hooks that might have been registered with
+        # accelerator.register_model_state_hook
+        for hook in self._load_model_state_pre_hook.values():
+            hook(models, input_dir)
+    
+        map_location = load_model_func_kwargs.pop("map_location", None)
+        if map_location is None:
+            if self.num_processes > 1 and self.distributed_type in (
+                DistributedType.MULTI_GPU,
+                DistributedType.MULTI_MLU,
+                DistributedType.MULTI_MUSA,
+                DistributedType.MULTI_NPU,
+            ):
+                map_location = "on_device"
+            else:
+                map_location = "cpu"
+    
+        override_attributes = load_accelerator_state(
+            input_dir,
+            models,
+            optimizers,
+            schedulers,
+            dataloaders,
+            self.state.process_index,
+            self.scaler,
+            map_location,
+            **load_model_func_kwargs,
+        )
+>       self.step = override_attributes["step"]
+E       KeyError: 'step'
+
+../../miniconda3/envs/fluxvla/lib/python3.10/site-packages/accelerate/accelerator.py:3156: KeyError
+----------------------------- Captured stdout call -----------------------------
+{"update": 1, "loss": 3.407325506210327, "loss_video": 1.352468729019165, "loss_action": 1.8282201290130615, "sigma_mean": 0.8739000558853149, "loss_representation": 1.1107866764068604, "pseudo_label_fraction": 0.0, "loss_subtask": 0.1424139440059662, "learning_rate": 8.55017856687341e-05}
+{"update": 2, "loss": 3.20194411277771, "loss_video": 0.9924536943435669, "loss_action": 1.841503381729126, "sigma_mean": 0.8319190740585327, "loss_representation": 1.062116026878357, "pseudo_label_fraction": 0.0, "loss_subtask": 0.14521026611328125, "learning_rate": 5.05e-05}
+{"update": 3, "loss": 4.260031223297119, "loss_video": 1.5467581748962402, "loss_action": 2.6435534954071045, "sigma_mean": 0.8397564888000488, "loss_representation": 1.0319485664367676, "pseudo_label_fraction": 0.0, "loss_subtask": 0.17540031671524048, "learning_rate": 1.5498214331265904e-05}
+{"update": 4, "loss": 5.063368320465088, "loss_video": 1.8982216119766235, "loss_action": 3.208789825439453, "sigma_mean": 0.6241689920425415, "loss_representation": 1.1166378259658813, "pseudo_label_fraction": 0.0, "loss_subtask": 0.12157496809959412, "learning_rate": 1.0000000000000002e-06}
+{"update": 1, "loss": 3.407325506210327, "loss_video": 1.352468729019165, "loss_action": 1.8282201290130615, "sigma_mean": 0.8739000558853149, "loss_representation": 1.1107866764068604, "pseudo_label_fraction": 0.0, "loss_subtask": 0.1424139440059662, "learning_rate": 8.55017856687341e-05}
+{"update": 2, "loss": 3.20194411277771, "loss_video": 0.9924536943435669, "loss_action": 1.841503381729126, "sigma_mean": 0.8319190740585327, "loss_representation": 1.062116026878357, "pseudo_label_fraction": 0.0, "loss_subtask": 0.14521026611328125, "learning_rate": 5.05e-05}
+_ test_combined_visual_history_and_self_flow_teacher_resume_without_reencoding[2] _
+
+tmp_path = PosixPath('/tmp/pytest-of-chuong/pytest-1031/test_combined_visual_history_a1')
+variant = 2
+
+    @pytest.mark.parametrize("variant", [1, 2, 3])
+    def test_combined_visual_history_and_self_flow_teacher_resume_without_reencoding(tmp_path, variant):
+        def create(directory, **policy_changes):
+            torch.manual_seed(71)
+            model = FluxAssetPolicy(
+                make_tiny_policy(
+                    text_dim=16,
+                    width=32,
+                    depth=2,
+                    self_flow_variant=variant,
+                    self_flow_label_warmup=1,
+                    self_flow_pseudo_label_fraction=1,
+                    self_flow_sampling_steps=2,
+                    condition_dropout=0.2,
+                    **policy_changes,
+                ),
+                SmallImageAsset(),
+                TrainableVisualConditioning(),
+                history_pool_size=2,
+            )
+            return OptimizationRun(
+                model,
+                VisualHistoryExamples(length=8, text_dim=16),
+                run_settings(directory, epochs=1, accumulation=1),
+            )
+    
+        baseline = create(tmp_path / "baseline")
+        baseline.train()
+        assert baseline.model.text_encoder.calls == 4
+        assert baseline.model.policy._optimizer_updates == baseline.ema.updates == 4
+        interrupted = create(tmp_path / "interrupted")
+        checkpoint = interrupted.checkpoint
+    
+        class Interrupted(Exception):
+            pass
+    
+        def stop_after_save(epoch, next_batch, **kwargs):
+            checkpoint(epoch, next_batch, **kwargs)
+            raise Interrupted
+    
+        interrupted.checkpoint = stop_after_save
+        with pytest.raises(Interrupted):
+            interrupted.train()
+        resumed = create(tmp_path / "resumed")
+>       resumed.restore(tmp_path / "interrupted" / "step_0000002")
+
+tests/test_averaging.py:385: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/patchwam/engine.py:293: in restore
+    self.accelerator.load_state(str(directory))
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <accelerate.accelerator.Accelerator object at 0x74cb1ad5b670>
+input_dir = '/tmp/pytest-of-chuong/pytest-1031/test_combined_visual_history_a1/interrupted/step_0000002'
+load_model_func_kwargs = {}
+
+    def load_state(self, input_dir: str = None, **load_model_func_kwargs):
+        """
+        Loads the current states of the model, optimizer, scaler, RNG generators, and registered objects.
+    
+        <Tip>
+    
+        Should only be used in conjunction with [`Accelerator.save_state`]. If a file is not registered for
+        checkpointing, it will not be loaded if stored in the directory.
+    
+        </Tip>
+    
+        Args:
+            input_dir (`str` or `os.PathLike`):
+                The name of the folder all relevant weights and states were saved in. Can be `None` if
+                `automatic_checkpoint_naming` is used, and will pick up from the latest checkpoint.
+            load_model_func_kwargs (`dict`, *optional*):
+                Additional keyword arguments for loading model which can be passed to the underlying load function,
+                such as optional arguments for DeepSpeed's `load_checkpoint` function or a `map_location` to load the
+                model and optimizer on.
+    
+        Example:
+    
+        ```python
+        >>> from accelerate import Accelerator
+    
+        >>> accelerator = Accelerator()
+        >>> model, optimizer, lr_scheduler = ...
+        >>> model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
+        >>> accelerator.load_state("my_checkpoint")
+        ```
+        """
+        if input_dir is not None:
+            # Check if folder exists
+            input_dir = os.path.expanduser(input_dir)
+            if not os.path.isdir(input_dir):
+                raise ValueError(f"Tried to find {input_dir} but folder does not exist")
+        elif self.project_configuration.automatic_checkpoint_naming:
+            # Pick up from automatic checkpoint naming
+            input_dir = os.path.join(self.project_dir, "checkpoints")
+            folders = [os.path.join(input_dir, folder) for folder in os.listdir(input_dir)]
+    
+            def _inner(folder):
+                return list(map(int, re.findall(r"[\/]?([0-9]+)(?=[^\/]*$)", folder)))[0]
+    
+            folders.sort(key=_inner)
+            input_dir = folders[-1]
+        else:
+            raise ValueError("No input_dir provided and automatic checkpoint naming is disabled.")
+        logger.info(f"Loading states from {input_dir}")
+    
+        # Load the models taking care of FSDP and DeepSpeed nuances
+        models = []
+        for i, model in enumerate(self._models):
+            if self.distributed_type == DistributedType.FSDP:
+                logger.info("Loading FSDP model")
+                load_fsdp_model(self.state.fsdp_plugin, self, model, input_dir, i)
+                logger.info(f"FSDP Model loaded from input dir {input_dir}")
+            elif self.distributed_type == DistributedType.DEEPSPEED:
+                logger.info("Loading DeepSpeed Model and Optimizer")
+                ckpt_id = f"{MODEL_NAME}" if i == 0 else f"{MODEL_NAME}_{i}"
+                model.load_checkpoint(input_dir, ckpt_id, **load_model_func_kwargs)
+                logger.info(f"DeepSpeed Model and Optimizer loaded from input dir {os.path.join(input_dir, ckpt_id)}")
+            elif self.distributed_type == DistributedType.MEGATRON_LM:
+                logger.info("Loading Megatron-LM Model, Optimizer and Scheduler")
+                model.load_checkpoint(input_dir)
+                logger.info(f"Megatron-LM Model , Optimizer and Scheduler loaded from input dir {input_dir}")
+            else:
+                models.append(model)
+    
+        # Load the optimizers taking care of FSDP and DeepSpeed nuances
+        optimizers = []
+        if self.distributed_type == DistributedType.FSDP:
+            for i, opt in enumerate(self._optimizers):
+                logger.info("Loading FSDP Optimizer")
+                load_fsdp_optimizer(self.state.fsdp_plugin, self, opt, self._models[i], input_dir, i)
+                logger.info(f"FSDP Optimizer loaded from input dir {input_dir}")
+        elif self.distributed_type not in [DistributedType.DEEPSPEED, DistributedType.MEGATRON_LM]:
+            optimizers = self._optimizers
+    
+        # Load the lr schedulers taking care of DeepSpeed nuances
+        schedulers = []
+        if self.distributed_type == DistributedType.DEEPSPEED:
+            for i, scheduler in enumerate(self._schedulers):
+                if isinstance(scheduler, DeepSpeedSchedulerWrapper):
+                    continue
+                schedulers.append(scheduler)
+        elif self.distributed_type not in [DistributedType.MEGATRON_LM]:
+            schedulers = self._schedulers
+    
+        dataloaders = self._dataloaders
+    
+        # Call model loading hooks that might have been registered with
+        # accelerator.register_model_state_hook
+        for hook in self._load_model_state_pre_hook.values():
+            hook(models, input_dir)
+    
+        map_location = load_model_func_kwargs.pop("map_location", None)
+        if map_location is None:
+            if self.num_processes > 1 and self.distributed_type in (
+                DistributedType.MULTI_GPU,
+                DistributedType.MULTI_MLU,
+                DistributedType.MULTI_MUSA,
+                DistributedType.MULTI_NPU,
+            ):
+                map_location = "on_device"
+            else:
+                map_location = "cpu"
+    
+        override_attributes = load_accelerator_state(
+            input_dir,
+            models,
+            optimizers,
+            schedulers,
+            dataloaders,
+            self.state.process_index,
+            self.scaler,
+            map_location,
+            **load_model_func_kwargs,
+        )
+>       self.step = override_attributes["step"]
+E       KeyError: 'step'
+
+../../miniconda3/envs/fluxvla/lib/python3.10/site-packages/accelerate/accelerator.py:3156: KeyError
+----------------------------- Captured stdout call -----------------------------
+{"update": 1, "loss": 3.454530954360962, "loss_video": 0.04218520596623421, "loss_action": 2.556029796600342, "sigma_mean": 0.8739000558853149, "loss_representation": 1.0789587497711182, "pseudo_label_fraction": 0.0, "loss_subtask": 0.1424139440059662, "learning_rate": 8.55017856687341e-05}
+{"update": 2, "loss": 2.670787811279297, "loss_video": 0.0638713613152504, "loss_action": 1.781958818435669, "sigma_mean": 0.993433952331543, "loss_representation": 1.0529654026031494, "pseudo_label_fraction": 0.0, "loss_subtask": 0.14520815014839172, "learning_rate": 5.05e-05}
+{"update": 3, "loss": 2.376918315887451, "loss_video": 1.1850436925888062, "loss_action": 0.8754884600639343, "sigma_mean": 0.8579221963882446, "loss_representation": 1.1142098903656006, "pseudo_label_fraction": 0.0, "loss_subtask": 0.17539994418621063, "learning_rate": 1.5498214331265904e-05}
+{"update": 4, "loss": 3.0121710300445557, "loss_video": 0.1482115387916565, "loss_action": 2.0713400840759277, "sigma_mean": 0.9845749139785767, "loss_representation": 1.068208932876587, "pseudo_label_fraction": 0.0, "loss_subtask": 0.12158036977052689, "learning_rate": 1.0000000000000002e-06}
+{"update": 1, "loss": 3.454530954360962, "loss_video": 0.04218520596623421, "loss_action": 2.556029796600342, "sigma_mean": 0.8739000558853149, "loss_representation": 1.0789587497711182, "pseudo_label_fraction": 0.0, "loss_subtask": 0.1424139440059662, "learning_rate": 8.55017856687341e-05}
+{"update": 2, "loss": 2.670787811279297, "loss_video": 0.0638713613152504, "loss_action": 1.781958818435669, "sigma_mean": 0.993433952331543, "loss_representation": 1.0529654026031494, "pseudo_label_fraction": 0.0, "loss_subtask": 0.14520815014839172, "learning_rate": 5.05e-05}
+_ test_combined_visual_history_and_self_flow_teacher_resume_without_reencoding[3] _
+
+tmp_path = PosixPath('/tmp/pytest-of-chuong/pytest-1031/test_combined_visual_history_a2')
+variant = 3
+
+    @pytest.mark.parametrize("variant", [1, 2, 3])
+    def test_combined_visual_history_and_self_flow_teacher_resume_without_reencoding(tmp_path, variant):
+        def create(directory, **policy_changes):
+            torch.manual_seed(71)
+            model = FluxAssetPolicy(
+                make_tiny_policy(
+                    text_dim=16,
+                    width=32,
+                    depth=2,
+                    self_flow_variant=variant,
+                    self_flow_label_warmup=1,
+                    self_flow_pseudo_label_fraction=1,
+                    self_flow_sampling_steps=2,
+                    condition_dropout=0.2,
+                    **policy_changes,
+                ),
+                SmallImageAsset(),
+                TrainableVisualConditioning(),
+                history_pool_size=2,
+            )
+            return OptimizationRun(
+                model,
+                VisualHistoryExamples(length=8, text_dim=16),
+                run_settings(directory, epochs=1, accumulation=1),
+            )
+    
+        baseline = create(tmp_path / "baseline")
+        baseline.train()
+        assert baseline.model.text_encoder.calls == 4
+        assert baseline.model.policy._optimizer_updates == baseline.ema.updates == 4
+        interrupted = create(tmp_path / "interrupted")
+        checkpoint = interrupted.checkpoint
+    
+        class Interrupted(Exception):
+            pass
+    
+        def stop_after_save(epoch, next_batch, **kwargs):
+            checkpoint(epoch, next_batch, **kwargs)
+            raise Interrupted
+    
+        interrupted.checkpoint = stop_after_save
+        with pytest.raises(Interrupted):
+            interrupted.train()
+        resumed = create(tmp_path / "resumed")
+>       resumed.restore(tmp_path / "interrupted" / "step_0000002")
+
+tests/test_averaging.py:385: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/patchwam/engine.py:293: in restore
+    self.accelerator.load_state(str(directory))
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <accelerate.accelerator.Accelerator object at 0x74cb1a5e0dc0>
+input_dir = '/tmp/pytest-of-chuong/pytest-1031/test_combined_visual_history_a2/interrupted/step_0000002'
+load_model_func_kwargs = {}
+
+    def load_state(self, input_dir: str = None, **load_model_func_kwargs):
+        """
+        Loads the current states of the model, optimizer, scaler, RNG generators, and registered objects.
+    
+        <Tip>
+    
+        Should only be used in conjunction with [`Accelerator.save_state`]. If a file is not registered for
+        checkpointing, it will not be loaded if stored in the directory.
+    
+        </Tip>
+    
+        Args:
+            input_dir (`str` or `os.PathLike`):
+                The name of the folder all relevant weights and states were saved in. Can be `None` if
+                `automatic_checkpoint_naming` is used, and will pick up from the latest checkpoint.
+            load_model_func_kwargs (`dict`, *optional*):
+                Additional keyword arguments for loading model which can be passed to the underlying load function,
+                such as optional arguments for DeepSpeed's `load_checkpoint` function or a `map_location` to load the
+                model and optimizer on.
+    
+        Example:
+    
+        ```python
+        >>> from accelerate import Accelerator
+    
+        >>> accelerator = Accelerator()
+        >>> model, optimizer, lr_scheduler = ...
+        >>> model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
+        >>> accelerator.load_state("my_checkpoint")
+        ```
+        """
+        if input_dir is not None:
+            # Check if folder exists
+            input_dir = os.path.expanduser(input_dir)
+            if not os.path.isdir(input_dir):
+                raise ValueError(f"Tried to find {input_dir} but folder does not exist")
+        elif self.project_configuration.automatic_checkpoint_naming:
+            # Pick up from automatic checkpoint naming
+            input_dir = os.path.join(self.project_dir, "checkpoints")
+            folders = [os.path.join(input_dir, folder) for folder in os.listdir(input_dir)]
+    
+            def _inner(folder):
+                return list(map(int, re.findall(r"[\/]?([0-9]+)(?=[^\/]*$)", folder)))[0]
+    
+            folders.sort(key=_inner)
+            input_dir = folders[-1]
+        else:
+            raise ValueError("No input_dir provided and automatic checkpoint naming is disabled.")
+        logger.info(f"Loading states from {input_dir}")
+    
+        # Load the models taking care of FSDP and DeepSpeed nuances
+        models = []
+        for i, model in enumerate(self._models):
+            if self.distributed_type == DistributedType.FSDP:
+                logger.info("Loading FSDP model")
+                load_fsdp_model(self.state.fsdp_plugin, self, model, input_dir, i)
+                logger.info(f"FSDP Model loaded from input dir {input_dir}")
+            elif self.distributed_type == DistributedType.DEEPSPEED:
+                logger.info("Loading DeepSpeed Model and Optimizer")
+                ckpt_id = f"{MODEL_NAME}" if i == 0 else f"{MODEL_NAME}_{i}"
+                model.load_checkpoint(input_dir, ckpt_id, **load_model_func_kwargs)
+                logger.info(f"DeepSpeed Model and Optimizer loaded from input dir {os.path.join(input_dir, ckpt_id)}")
+            elif self.distributed_type == DistributedType.MEGATRON_LM:
+                logger.info("Loading Megatron-LM Model, Optimizer and Scheduler")
+                model.load_checkpoint(input_dir)
+                logger.info(f"Megatron-LM Model , Optimizer and Scheduler loaded from input dir {input_dir}")
+            else:
+                models.append(model)
+    
+        # Load the optimizers taking care of FSDP and DeepSpeed nuances
+        optimizers = []
+        if self.distributed_type == DistributedType.FSDP:
+            for i, opt in enumerate(self._optimizers):
+                logger.info("Loading FSDP Optimizer")
+                load_fsdp_optimizer(self.state.fsdp_plugin, self, opt, self._models[i], input_dir, i)
+                logger.info(f"FSDP Optimizer loaded from input dir {input_dir}")
+        elif self.distributed_type not in [DistributedType.DEEPSPEED, DistributedType.MEGATRON_LM]:
+            optimizers = self._optimizers
+    
+        # Load the lr schedulers taking care of DeepSpeed nuances
+        schedulers = []
+        if self.distributed_type == DistributedType.DEEPSPEED:
+            for i, scheduler in enumerate(self._schedulers):
+                if isinstance(scheduler, DeepSpeedSchedulerWrapper):
+                    continue
+                schedulers.append(scheduler)
+        elif self.distributed_type not in [DistributedType.MEGATRON_LM]:
+            schedulers = self._schedulers
+    
+        dataloaders = self._dataloaders
+    
+        # Call model loading hooks that might have been registered with
+        # accelerator.register_model_state_hook
+        for hook in self._load_model_state_pre_hook.values():
+            hook(models, input_dir)
+    
+        map_location = load_model_func_kwargs.pop("map_location", None)
+        if map_location is None:
+            if self.num_processes > 1 and self.distributed_type in (
+                DistributedType.MULTI_GPU,
+                DistributedType.MULTI_MLU,
+                DistributedType.MULTI_MUSA,
+                DistributedType.MULTI_NPU,
+            ):
+                map_location = "on_device"
+            else:
+                map_location = "cpu"
+    
+        override_attributes = load_accelerator_state(
+            input_dir,
+            models,
+            optimizers,
+            schedulers,
+            dataloaders,
+            self.state.process_index,
+            self.scaler,
+            map_location,
+            **load_model_func_kwargs,
+        )
+>       self.step = override_attributes["step"]
+E       KeyError: 'step'
+
+../../miniconda3/envs/fluxvla/lib/python3.10/site-packages/accelerate/accelerator.py:3156: KeyError
+----------------------------- Captured stdout call -----------------------------
+{"update": 1, "loss": 1.146080732345581, "loss_video": 0.3927200436592102, "loss_action": 0.0, "sigma_mean": 0.8224000930786133, "loss_representation": 1.169349193572998, "pseudo_label_fraction": 1.0, "pseudo_mse": 0.0, "loss_subtask": 0.1424139440059662, "learning_rate": 8.55017856687341e-05}
+{"update": 2, "loss": 1.914864420890808, "loss_video": 0.2123221606016159, "loss_action": 0.8862354159355164, "sigma_mean": 0.9120410084724426, "loss_representation": 1.1349339485168457, "pseudo_label_fraction": 1.0, "pseudo_mse": 1.240864634513855, "loss_subtask": 0.14520792663097382, "learning_rate": 5.05e-05}
+{"update": 3, "loss": 2.743474006652832, "loss_video": 1.9098081588745117, "loss_action": 0.8669925332069397, "sigma_mean": 0.7788349390029907, "loss_representation": 1.1300469636917114, "pseudo_label_fraction": 1.0, "pseudo_mse": 1.2180780172348022, "loss_subtask": 0.17540021240711212, "learning_rate": 1.5498214331265904e-05}
+{"update": 4, "loss": 3.1878340244293213, "loss_video": 2.3443617820739746, "loss_action": 1.0755285024642944, "sigma_mean": 0.7087817192077637, "loss_representation": 1.1599582433700562, "pseudo_label_fraction": 1.0, "pseudo_mse": 1.022991418838501, "loss_subtask": 0.12158048897981644, "learning_rate": 1.0000000000000002e-06}
+{"update": 1, "loss": 1.146080732345581, "loss_video": 0.3927200436592102, "loss_action": 0.0, "sigma_mean": 0.8224000930786133, "loss_representation": 1.169349193572998, "pseudo_label_fraction": 1.0, "pseudo_mse": 0.0, "loss_subtask": 0.1424139440059662, "learning_rate": 8.55017856687341e-05}
+{"update": 2, "loss": 1.914864420890808, "loss_video": 0.2123221606016159, "loss_action": 0.8862354159355164, "sigma_mean": 0.9120410084724426, "loss_representation": 1.1349339485168457, "pseudo_label_fraction": 1.0, "pseudo_mse": 1.240864634513855, "loss_subtask": 0.14520792663097382, "learning_rate": 5.05e-05}
+_____ test_interrupted_training_restores_model_optimizer_scheduler_and_rng _____
+
+tmp_path = PosixPath('/tmp/pytest-of-chuong/pytest-1031/test_interrupted_training_rest0')
+
+    def test_interrupted_training_restores_model_optimizer_scheduler_and_rng(tmp_path):
+        baseline = make_run(tmp_path / "baseline")
+        baseline.train()
+        expected = {key: value.clone() for key, value in baseline.model.state_dict().items()}
+    
+        interrupted = make_run(tmp_path / "interrupted")
+        checkpoint = interrupted.checkpoint
+    
+        class Interrupted(Exception):
+            pass
+    
+        def stop_after_save(epoch, next_batch):
+            checkpoint(epoch, next_batch)
+            raise Interrupted
+    
+        interrupted.checkpoint = stop_after_save
+        with pytest.raises(Interrupted):
+            interrupted.train()
+    
+        resumed = make_run(tmp_path / "resumed")
+>       resumed.restore(tmp_path / "interrupted" / "step_0000002")
+
+tests/test_engine.py:56: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/patchwam/engine.py:293: in restore
+    self.accelerator.load_state(str(directory))
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <accelerate.accelerator.Accelerator object at 0x74cd81ae0b80>
+input_dir = '/tmp/pytest-of-chuong/pytest-1031/test_interrupted_training_rest0/interrupted/step_0000002'
+load_model_func_kwargs = {}
+
+    def load_state(self, input_dir: str = None, **load_model_func_kwargs):
+        """
+        Loads the current states of the model, optimizer, scaler, RNG generators, and registered objects.
+    
+        <Tip>
+    
+        Should only be used in conjunction with [`Accelerator.save_state`]. If a file is not registered for
+        checkpointing, it will not be loaded if stored in the directory.
+    
+        </Tip>
+    
+        Args:
+            input_dir (`str` or `os.PathLike`):
+                The name of the folder all relevant weights and states were saved in. Can be `None` if
+                `automatic_checkpoint_naming` is used, and will pick up from the latest checkpoint.
+            load_model_func_kwargs (`dict`, *optional*):
+                Additional keyword arguments for loading model which can be passed to the underlying load function,
+                such as optional arguments for DeepSpeed's `load_checkpoint` function or a `map_location` to load the
+                model and optimizer on.
+    
+        Example:
+    
+        ```python
+        >>> from accelerate import Accelerator
+    
+        >>> accelerator = Accelerator()
+        >>> model, optimizer, lr_scheduler = ...
+        >>> model, optimizer, lr_scheduler = accelerator.prepare(model, optimizer, lr_scheduler)
+        >>> accelerator.load_state("my_checkpoint")
+        ```
+        """
+        if input_dir is not None:
+            # Check if folder exists
+            input_dir = os.path.expanduser(input_dir)
+            if not os.path.isdir(input_dir):
+                raise ValueError(f"Tried to find {input_dir} but folder does not exist")
+        elif self.project_configuration.automatic_checkpoint_naming:
+            # Pick up from automatic checkpoint naming
+            input_dir = os.path.join(self.project_dir, "checkpoints")
+            folders = [os.path.join(input_dir, folder) for folder in os.listdir(input_dir)]
+    
+            def _inner(folder):
+                return list(map(int, re.findall(r"[\/]?([0-9]+)(?=[^\/]*$)", folder)))[0]
+    
+            folders.sort(key=_inner)
+            input_dir = folders[-1]
+        else:
+            raise ValueError("No input_dir provided and automatic checkpoint naming is disabled.")
+        logger.info(f"Loading states from {input_dir}")
+    
+        # Load the models taking care of FSDP and DeepSpeed nuances
+        models = []
+        for i, model in enumerate(self._models):
+            if self.distributed_type == DistributedType.FSDP:
+                logger.info("Loading FSDP model")
+                load_fsdp_model(self.state.fsdp_plugin, self, model, input_dir, i)
+                logger.info(f"FSDP Model loaded from input dir {input_dir}")
+            elif self.distributed_type == DistributedType.DEEPSPEED:
+                logger.info("Loading DeepSpeed Model and Optimizer")
+                ckpt_id = f"{MODEL_NAME}" if i == 0 else f"{MODEL_NAME}_{i}"
+                model.load_checkpoint(input_dir, ckpt_id, **load_model_func_kwargs)
+                logger.info(f"DeepSpeed Model and Optimizer loaded from input dir {os.path.join(input_dir, ckpt_id)}")
+            elif self.distributed_type == DistributedType.MEGATRON_LM:
+                logger.info("Loading Megatron-LM Model, Optimizer and Scheduler")
+                model.load_checkpoint(input_dir)
+                logger.info(f"Megatron-LM Model , Optimizer and Scheduler loaded from input dir {input_dir}")
+            else:
+                models.append(model)
+    
+        # Load the optimizers taking care of FSDP and DeepSpeed nuances
+        optimizers = []
+        if self.distributed_type == DistributedType.FSDP:
+            for i, opt in enumerate(self._optimizers):
+                logger.info("Loading FSDP Optimizer")
+                load_fsdp_optimizer(self.state.fsdp_plugin, self, opt, self._models[i], input_dir, i)
+                logger.info(f"FSDP Optimizer loaded from input dir {input_dir}")
+        elif self.distributed_type not in [DistributedType.DEEPSPEED, DistributedType.MEGATRON_LM]:
+            optimizers = self._optimizers
+    
+        # Load the lr schedulers taking care of DeepSpeed nuances
+        schedulers = []
+        if self.distributed_type == DistributedType.DEEPSPEED:
+            for i, scheduler in enumerate(self._schedulers):
+                if isinstance(scheduler, DeepSpeedSchedulerWrapper):
+                    continue
+                schedulers.append(scheduler)
+        elif self.distributed_type not in [DistributedType.MEGATRON_LM]:
+            schedulers = self._schedulers
+    
+        dataloaders = self._dataloaders
+    
+        # Call model loading hooks that might have been registered with
+        # accelerator.register_model_state_hook
+        for hook in self._load_model_state_pre_hook.values():
+            hook(models, input_dir)
+    
+        map_location = load_model_func_kwargs.pop("map_location", None)
+        if map_location is None:
+            if self.num_processes > 1 and self.distributed_type in (
+                DistributedType.MULTI_GPU,
+                DistributedType.MULTI_MLU,
+                DistributedType.MULTI_MUSA,
+                DistributedType.MULTI_NPU,
+            ):
+                map_location = "on_device"
+            else:
+                map_location = "cpu"
+    
+        override_attributes = load_accelerator_state(
+            input_dir,
+            models,
+            optimizers,
+            schedulers,
+            dataloaders,
+            self.state.process_index,
+            self.scaler,
+            map_location,
+            **load_model_func_kwargs,
+        )
+>       self.step = override_attributes["step"]
+E       KeyError: 'step'
+
+../../miniconda3/envs/fluxvla/lib/python3.10/site-packages/accelerate/accelerator.py:3156: KeyError
+----------------------------- Captured stdout call -----------------------------
+{"update": 1, "loss": 1.2771981954574585, "learning_rate": 8.55017856687341e-05}
+{"update": 2, "loss": 1.3057622909545898, "learning_rate": 5.05e-05}
+{"update": 3, "loss": 1.3429322242736816, "learning_rate": 1.5498214331265904e-05}
+{"update": 4, "loss": 1.382176160812378, "learning_rate": 1.0000000000000002e-06}
+{"update": 1, "loss": 1.2771981954574585, "learning_rate": 8.55017856687341e-05}
+{"update": 2, "loss": 1.3057622909545898, "learning_rate": 5.05e-05}
+=============================== warnings summary ===============================
+tests/test_engine.py::test_exhausted_training_saves_cursor_after_skipped_update
+  /home/chuong/miniconda3/envs/fluxvla/lib/python3.10/site-packages/torch/optim/lr_scheduler.py:182: UserWarning: Seems like `optimizer.step()` has been overridden after learning rate scheduler initialization. Please, make sure to call `optimizer.step()` before `lr_scheduler.step()`. See more details at https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate
+    warnings.warn(
+
+tests/test_engine.py::test_scheduler_matches_linear_warmup_cosine_floor_contract
+  /home/chuong/miniconda3/envs/fluxvla/lib/python3.10/site-packages/torch/optim/lr_scheduler.py:209: UserWarning: The epoch parameter in `scheduler.step()` was not necessary and is being deprecated where possible. Please use `scheduler.step()` to step the scheduler. During the deprecation, if epoch is different from None, the closed form is used instead of the new chainable form, where available. Please open an issue if you are unable to replicate your use case: https://github.com/pytorch/pytorch/issues/new/choose.
+    warnings.warn(EPOCH_DEPRECATION_WARNING, UserWarning)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_conditioning_flow.py::test_self_flow_teacher_and_label_warmup_continue_with_engine
+FAILED tests/test_averaging.py::test_checkpoint_continuation_restores_average_and_native_export_exactly
+FAILED tests/test_averaging.py::test_combined_visual_history_and_self_flow_teacher_resume_without_reencoding[1]
+FAILED tests/test_averaging.py::test_combined_visual_history_and_self_flow_teacher_resume_without_reencoding[2]
+FAILED tests/test_averaging.py::test_combined_visual_history_and_self_flow_teacher_resume_without_reencoding[3]
+FAILED tests/test_engine.py::test_interrupted_training_restores_model_optimizer_scheduler_and_rng
+6 failed, 106 passed, 2 warnings in 3.66s

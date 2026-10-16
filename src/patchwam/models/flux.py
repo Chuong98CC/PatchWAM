@@ -17,7 +17,42 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .geometry import flatten_image_latents, raster_coordinates
+from .lora import (
+    ADAPTER_PARAMETER_SUFFIXES,
+    LowRankResidualLinear,
+    adapter_parameter_name,
+    attach_block_adapters,
+    validate_adapter_settings,
+)
 from .policy import PatchFlowPolicy
+
+# Recorded in the checkpoint contract. Only the wrapped block projection weights
+# are frozen in DiT LoRA mode; every other pretrained DiT parameter, the policy
+# heads, and the adapters train. Any change to this policy must change the marker
+# so an existing LoRA run cannot resume under different optimizer behavior.
+DIT_LORA_TRAINING_POLICY = "frozen_wrapped_block_bases_remaining_dit_trainable"
+
+
+def _parameter_layer_name(name: str) -> str:
+    """Strip a trailing weight or bias term from a parameter name."""
+    head, _, leaf = name.rpartition(".")
+    return head if head and leaf in {"weight", "bias"} else name
+
+
+def _adapter_layer_name(name: str) -> str:
+    """The wrapped projection path of an adapter parameter name."""
+    for suffix in ADAPTER_PARAMETER_SUFFIXES:
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def _parameter_scope(name: str) -> str:
+    """Group frozen tensors by pretrained asset or policy head."""
+    parts = name.split(".")
+    if parts[:2] == ["policy", "denoiser"]:
+        return "policy.denoiser.transformer" if parts[2:3] == ["transformer"] else "policy.denoiser"
+    return parts[0]
 
 
 def _asset_file_identity(path: Path) -> dict[str, Any]:
@@ -47,7 +82,11 @@ def _asset_identity(transformer_path, autoencoder_path, text_encoder_path, modul
 class OfficialFluxDenoiser(nn.Module):
     """Masked execution with unchanged official parameter names."""
 
-    def __init__(self, transformer: nn.Module, *, gradient_checkpointing: bool = False):
+    def __init__(
+        self, transformer: nn.Module, *, gradient_checkpointing: bool = False,
+        dit_lora: bool = False, dit_lora_rank: int = 64, dit_lora_alpha: float = 128,
+        dit_lora_dropout: float = 0.05,
+    ):
         super().__init__()
         model_api = importlib.import_module("flux2.model")
         self._rotate = model_api.apply_rope
@@ -64,6 +103,45 @@ class OfficialFluxDenoiser(nn.Module):
         self.gradient_checkpointing = gradient_checkpointing
         self.representation_dim = transformer.hidden_size
         self.representation_layers = len(transformer.double_blocks) + len(transformer.single_blocks)
+        if type(dit_lora) is not bool:
+            raise ValueError("dit_lora must be a boolean")
+        self.dit_lora = dit_lora
+        self.dit_lora_rank, self.dit_lora_alpha = dit_lora_rank, dit_lora_alpha
+        self.dit_lora_dropout = dit_lora_dropout
+        self.lora_targets: list[str] = []
+        if dit_lora:
+            validate_adapter_settings(dit_lora_rank, dit_lora_alpha, dit_lora_dropout, prefix="dit_lora")
+            # Wrapping freezes only each projection's base weight. Every other
+            # pretrained DiT parameter keeps its ordinary full-mode training.
+            self.lora_targets = attach_block_adapters(
+                transformer, rank=dit_lora_rank, alpha=dit_lora_alpha, dropout=dit_lora_dropout
+            )
+
+    def dit_lora_contract(self) -> dict[str, Any] | None:
+        """LoRA settings recorded in the checkpoint contract, or None in full mode."""
+        if not self.dit_lora:
+            return None
+        return {
+            "dit_lora": True, "rank": self.dit_lora_rank, "alpha": self.dit_lora_alpha,
+            "dropout": self.dit_lora_dropout, "adapter_targets": len(self.lora_targets),
+            "adapter_layout": "block_attention_and_mlp_projections",
+            "training_policy": DIT_LORA_TRAINING_POLICY,
+        }
+
+    def freeze_adapter_bases(self):
+        """Freeze the wrapped block projection bases and re-assert adapter training.
+
+        No other DiT parameter flag is touched, so the remaining pretrained
+        parameters, the policy heads, and the adapters keep training as usual.
+        """
+        if not self.dit_lora:
+            raise ValueError("The denoiser is not configured for DiT LoRA")
+        for module in self.transformer.modules():
+            if isinstance(module, LowRankResidualLinear):
+                module.base.requires_grad_(False)
+                module.residual_in.requires_grad_(True)
+                module.residual_out.requires_grad_(True)
+        return self
 
     @staticmethod
     def _split_qkv_heads(projected: Tensor, count: int) -> tuple[Tensor, Tensor, Tensor]:
@@ -170,23 +248,101 @@ class FluxAssetPolicy(nn.Module):
         if history_pool_size < 1:
             raise ValueError("History pooling size must be positive")
         self.history_pool_size = int(history_pool_size)
+        # The denoiser owns the frozen DiT contract; the wrapper mirrors it so
+        # encoder and checkpoint handling agree with the backbone configuration.
+        self.dit_lora = bool(getattr(policy.denoiser, "dit_lora", False))
         self.autoencoder.requires_grad_(False).eval()
-        if not getattr(self.text_encoder, "requires_images", False):
+        if self.dit_lora or not getattr(self.text_encoder, "requires_images", False):
             self.text_encoder.requires_grad_(False).eval()
 
     def checkpoint_contract(self):
         contract = getattr(self.text_encoder, "checkpoint_contract", None)
-        return {"history_pool_size": self.history_pool_size,
-                "text_encoder": contract() if callable(contract) else type(self.text_encoder).__qualname__}
+        result = {"history_pool_size": self.history_pool_size,
+                  "text_encoder": contract() if callable(contract) else type(self.text_encoder).__qualname__}
+        lora = getattr(self.policy.denoiser, "dit_lora_contract", None)
+        settings = lora() if callable(lora) else None
+        # Full mode keeps its recorded contract so existing resumes stay valid.
+        if settings is not None:
+            result["dit_lora"] = settings
+        return result
 
     def train(self, mode: bool = True):
         super().train(mode)
         self.autoencoder.eval()
-        if getattr(self.text_encoder, "requires_images", False):
+        if self.dit_lora:
+            # Dit LoRA freezes the complete text encoder, including VL adapters.
+            self.text_encoder.eval()
+        elif getattr(self.text_encoder, "requires_images", False):
             self.text_encoder.train(mode)
         else:
             self.text_encoder.eval()
         return self
+
+    def freeze_asset_encoders(self):
+        """Re-assert frozen assets and encoder modes at the start of a run.
+
+        In DiT LoRA mode this also re-freezes the wrapped adapter bases without
+        changing any other DiT parameter, so only the backbone projections that
+        the adapters replace stay frozen.
+        """
+        self.autoencoder.requires_grad_(False)
+        if self.dit_lora:
+            self.policy.denoiser.freeze_adapter_bases()
+            self.text_encoder.requires_grad_(False)
+        return self.train(self.training)
+
+    def parameter_report(self) -> dict[str, Any]:
+        """Exact named adapter, fully trainable, and frozen policy parameters."""
+        buckets: dict[str, list[dict[str, Any]]] = {"adapters": [], "fully_trainable": [], "frozen": []}
+        for name, parameter in self.named_parameters():
+            if not parameter.requires_grad:
+                bucket, layer = "frozen", _parameter_layer_name(name)
+            elif adapter_parameter_name(name):
+                bucket, layer = "adapters", _adapter_layer_name(name)
+            else:
+                bucket, layer = "fully_trainable", _parameter_layer_name(name)
+            buckets[bucket].append(
+                {"name": name, "layer": layer, "shape": list(parameter.shape), "parameters": parameter.numel()}
+            )
+        groups: dict[str, dict[str, Any]] = {}
+        for entry in buckets["frozen"]:
+            group = groups.setdefault(
+                _parameter_scope(entry["name"]),
+                {"tensor_count": 0, "parameter_count": 0, "layers": set()},
+            )
+            group["tensor_count"] += 1
+            group["parameter_count"] += entry["parameters"]
+            group["layers"].add(entry["layer"])
+        summary = {
+            bucket: {
+                "tensor_count": len(entries),
+                "parameter_count": sum(entry["parameters"] for entry in entries),
+                "tensors": [entry["name"] for entry in entries],
+                "layers": sorted({entry["layer"] for entry in entries}),
+            }
+            for bucket, entries in buckets.items()
+        }
+        summary["frozen"]["groups"] = {
+            scope: {
+                "tensor_count": group["tensor_count"],
+                "parameter_count": group["parameter_count"],
+                "layers": sorted(group["layers"]),
+            }
+            for scope, group in sorted(groups.items())
+        }
+        lora = getattr(self.policy.denoiser, "dit_lora_contract", None)
+        return {
+            "mode": "dit_lora" if self.dit_lora else "full",
+            "dit_lora": (lora() if callable(lora) else None) or {"dit_lora": False},
+            **summary,
+            "counts": {
+                "adapters": summary["adapters"]["tensor_count"],
+                "fully_trainable": summary["fully_trainable"]["tensor_count"],
+                "trainable": summary["adapters"]["tensor_count"] + summary["fully_trainable"]["tensor_count"],
+                "frozen": summary["frozen"]["tensor_count"],
+                "total": sum(summary[bucket]["tensor_count"] for bucket in ("adapters", "fully_trainable", "frozen")),
+            },
+        }
 
     def _encode(self, batch: Mapping[str, Any], *, target: bool) -> dict[str, Any]:
         cache_formats = batch.get("text_cache_format")
@@ -343,11 +499,22 @@ class FluxAssetPolicy(nn.Module):
         vl_history_pool_size: int = 4, vl_image_size: int = 448,
         vl_auxiliary_weight: float = 0.1, vl_label_smoothing: float = 0.1,
         vl_require_subtasks: bool = False, vl_gradient_checkpointing: bool = True,
+        dit_lora: bool = False, dit_lora_rank: int = 64, dit_lora_alpha: float = 128,
+        dit_lora_dropout: float = 0.05,
         **policy_options,
     ) -> "FluxAssetPolicy":
         """Load local assets without downloads or remote code."""
+        if type(dit_lora) is not bool:
+            raise ValueError("dit_lora must be a boolean")
+        if dit_lora and vl_trainable_adapters:
+            raise ValueError(
+                "dit_lora freezes the complete text encoder, including VL adapters; "
+                "set vl_trainable_adapters=false or disable dit_lora"
+            )
         if variant not in {"klein-base-4b", "klein-base-9b"}:
             raise ValueError("variant must be klein-base-4b or klein-base-9b")
+        if dit_lora:
+            validate_adapter_settings(dit_lora_rank, dit_lora_alpha, dit_lora_dropout, prefix="dit_lora")
         if dtype not in {"float32", "float16", "bfloat16"}:
             raise ValueError("Unsupported torch dtype")
         if context_length <= 0:
@@ -403,7 +570,10 @@ class FluxAssetPolicy(nn.Module):
             raise ValueError("text_encoder_kind must be qwen3 or qwen3_vl")
         if text_encoder.feature_dim != config.context_in_dim:
             raise ValueError(f"The text encoder provides {text_encoder.feature_dim} features; {variant} requires {config.context_in_dim}")
-        denoiser = OfficialFluxDenoiser(transformer, gradient_checkpointing=gradient_checkpointing)
+        denoiser = OfficialFluxDenoiser(
+            transformer, gradient_checkpointing=gradient_checkpointing, dit_lora=dit_lora,
+            dit_lora_rank=dit_lora_rank, dit_lora_alpha=dit_lora_alpha, dit_lora_dropout=dit_lora_dropout,
+        )
         policy = PatchFlowPolicy(
             denoiser, action_dim=action_dim, text_dim=config.context_in_dim, proprio_dim=proprio_dim,
             action_scale=action_scale, shift=shift, video_weight=video_weight, action_weight=action_weight,
